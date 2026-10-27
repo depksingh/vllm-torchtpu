@@ -63,6 +63,19 @@ stage 0's next forward is already queued while the engine core prepares
 the following step, and the rings are widened for that count.
 ``patch_executor_for_pp_handoff`` installs the engine side the flag
 selects.
+
+The engine keeps as many steps in flight as the pipeline has stages
+(``VllmConfig.max_concurrent_batches``) and dispatches the next one once
+the oldest has returned. The oldest returns when the last stage has
+sampled it, and the next step then reaches stage 0 through the engine
+core's update, schedule and RPC and the worker's input preparation, a
+chain of some 10 ms that is exposed whenever the last stage finishes less
+than that before the slowest stage. Under the wave,
+``TPU_PP_EXTRA_STEPS_IN_FLIGHT`` adds that many steps to the count, so the
+chain runs a wave earlier and stage 0's next forward is queued on its
+device behind the current one. The
+pushes a wait sends count the later steps that exist, so the deeper queue
+changes none of them.
 """
 
 import contextlib
@@ -71,6 +84,8 @@ from concurrent.futures import Future
 from typing import Any, cast
 
 from vllm.logger import init_logger
+
+from vllm_torchtpu import envs
 
 logger = init_logger(__name__)
 
@@ -252,6 +267,11 @@ def ring_extra_steps(stages: int) -> int:
     return max(1, stages // 2)
 
 
+def extra_steps_in_flight() -> int:
+    """Steps the engine keeps in flight beyond the pipeline depth."""
+    return int(envs.TPU_PP_EXTRA_STEPS_IN_FLIGHT)
+
+
 def rpc_ring_chunks(stages: int, extra: int = 0) -> int:
     """Messages each ring buffer between the engine and its workers must hold.
 
@@ -305,7 +325,7 @@ def widen_message_rings(vllm_config: Any) -> None:
         return
     stages = int(vllm_config.parallel_config.pipeline_parallel_size)
     if stages > 1:
-        extra = ring_extra_steps(stages) if ring_handoff() else 0
+        extra = ring_extra_steps(stages) if ring_handoff() else extra_steps_in_flight()
         _widen_rpc_ring(stages, extra)
         if extra:
             _raise_steps_in_flight(extra)
@@ -437,13 +457,17 @@ def patch_executor_for_pp_wave(vllm_config: Any) -> None:
     stages = int(vllm_config.parallel_config.pipeline_parallel_size)
     if stages <= 1:
         return
-    _widen_rpc_ring(stages)
+    extra = extra_steps_in_flight()
+    _widen_rpc_ring(stages, extra)
+    if extra > 0:
+        _raise_steps_in_flight(extra)
     from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 
     if getattr(MultiprocExecutor, "_tpu_pp_wave_patch", False):
         return
     orig_execute = MultiprocExecutor.execute_model
     orig_sample = MultiprocExecutor.sample_tokens
+    orig_profile = MultiprocExecutor.profile
 
     def execute_model(self, scheduler_output, non_block=False):
         if not _rides_the_wave(self):
@@ -468,11 +492,24 @@ def patch_executor_for_pp_wave(vllm_config: Any) -> None:
         future = _PushFuture(inner, self, state, state.last_step, state.real_steps)
         return future if non_block else future.result()
 
+    def profile(self, is_start=True, profile_prefix=None):
+        # A blocking RPC that every worker answers, sent while steps are in
+        # flight. A stage past the first reaches it only after the forwards
+        # queued ahead of it, and those wait in the hand-off for launches
+        # that only a push or a settle sends, which the engine sends only
+        # when it waits on a step's future. The settle goes out first, so
+        # every stage runs through its queued forwards and answers.
+        wave_state(self).settle(self)
+        return orig_profile(self, is_start, profile_prefix)
+
     MultiprocExecutor.execute_model = execute_model
     MultiprocExecutor.sample_tokens = sample_tokens
     _install_take_draft_token_ids(MultiprocExecutor)
+    MultiprocExecutor.profile = profile
     MultiprocExecutor._tpu_pp_wave_patch = True
     logger.info(
-        "PP wave: engine push and settle installed, message ring %d chunks",
+        "PP wave: engine push and settle installed, message ring %d chunks, "
+        "%d steps in flight beyond the pipeline depth",
         _ring_chunks_needed,
+        extra,
     )
