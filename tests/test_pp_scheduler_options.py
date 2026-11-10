@@ -442,3 +442,40 @@ def test_a_waiting_prefix_hit_counts_as_done_only_under_quadratic_cost():
     assert plain._waiting_warmth(_req(2048, 8192)) == 2048
     assert quad._waiting_warmth(_req(2048, 8192)) == 2048
 
+
+# -- the IX validation entries ---------------------------------------------------
+
+
+def _point_entries():
+    import pathlib
+
+    import yaml
+
+    from vllm_torchtpu.models import qwen3_5
+
+    folder = pathlib.Path(qwen3_5.__file__).parent / "validation"
+    for path in sorted(folder.glob("p[0-9][0-9]-*.yaml")):
+        with path.open() as f:
+            yield path.stem, yaml.safe_load(f)
+
+
+def test_the_prefill_legs_run_what_the_record_jobs_ran():
+    from vllm_torchtpu.core import scheduler_options
+
+    seen = []
+    for name, entry in _point_entries():
+        cfg = SimpleNamespace(
+            additional_config=entry["legs"]["prefill"]["additional_config"]
+        )
+        opts = pp_scheduler_options.get(cfg)
+        assert opts.quadratic_cost and opts.prefix_aware, name
+        assert opts.paw_aging_tok_per_s == 3000.0, name
+        assert opts.extra_steps_in_flight == 1, name
+        # In-flight costing and warmest-first promotion ran at #1 only.
+        point_one = entry["point"] == 1
+        assert opts.inflight_cost is point_one, name
+        assert scheduler_options.get(cfg).promote_warmest is point_one, name
+        # The decode legs run PrefixAwareScheduler, not this scheduler.
+        assert "tpu_pp_scheduler" not in entry["legs"]["decode"]["additional_config"]
+        seen.append(entry["point"])
+    assert seen == [1, 5, 8, 10, 12]
