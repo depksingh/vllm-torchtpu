@@ -790,7 +790,6 @@ class TPUModelRunner(GPUModelRunner):
             )
         with _torch_tpu_wrapper():
             super().__init__(vllm_config, device)
-        self.input_batch.thinking_budget_state_holder = None
         self.sequence_layout_planner = sequence_layout_planner
         _validate_libtpu_version()
         self.is_pooling_model = (
@@ -1085,6 +1084,7 @@ class TPUModelRunner(GPUModelRunner):
         self.execute_model_state: ExecuteModelState | None = None
         self._pre_async_results: AsyncPreResults | None = None
         self._min_tokens = min_tokens_mask.MinTokensTracker()
+        self.input_batch.thinking_budget_state_holder = None
         self._thinking_budget = thinking_budget_tracker.ThinkingBudgetTracker(
             self.vllm_config.reasoning_config,
             max_num_reqs=self.max_num_reqs,
