@@ -44,7 +44,11 @@ def _scheduler(
     waiting=(),
     step_limit=None,
     kv_holding_waiting=(),
+    **options,
 ) -> TpuPipelineChunkScheduler:
+    """A scheduler built without __init__; ``options`` sets option
+    attributes such as ``_inflight_cost=True`` (all off otherwise, as on an
+    engine that sets no tpu_pp_scheduler option)."""
     scheduler = TpuPipelineChunkScheduler.__new__(TpuPipelineChunkScheduler)
     scheduler._cost = cost
     scheduler._step_limit = step_limit
@@ -69,6 +73,8 @@ def _scheduler(
     scheduler._waits = 0
     scheduler._retention = None
     scheduler.kv_cache_manager = SimpleNamespace()
+    for name, value in options.items():
+        setattr(scheduler, name, value)
     return scheduler
 
 
@@ -500,7 +506,7 @@ def test_the_live_history_window_never_wraps_around():
 
 def test_schedule_keeps_the_last_stage_count_minus_one_step_estimates():
     model = _model()
-    scheduler = _scheduler(cost=model)
+    scheduler = _scheduler(cost=model, _inflight_cost=True)
     scheduler._pp_size = 4
     scheduler.requests = {"a": _request(4096, 32768, "a")}
     step = SimpleNamespace(
@@ -519,7 +525,7 @@ def test_schedule_keeps_the_last_stage_count_minus_one_step_estimates():
 
 def test_pushes_and_settles_age_the_steps_in_flight():
     model = _model()
-    scheduler = _scheduler(cost=model)
+    scheduler = _scheduler(cost=model, _inflight_cost=True)
     scheduler._pp_size = 4
     estimate = model.step_ms(4096, 0.0, float(4096**2))
     scheduler._inflight_ms = [estimate] * 3
@@ -565,7 +571,7 @@ def test_the_engine_core_patch_wires_the_executor_pushes_to_the_scheduler(
 
     class FakeCore:
         def __init__(self):
-            self.scheduler = _scheduler()
+            self.scheduler = _scheduler(_inflight_cost=True)
             self.model_executor = Executor([_report(10.0)])
 
     monkeypatch.setattr(engine_core, "EngineCore", FakeCore)
@@ -697,14 +703,18 @@ def test_a_padded_last_prompt_token_is_cut_back_to_the_prompt_end():
 
 
 def test_chunk_sizing_uses_live_lockstep_wave_ceiling():
-    scheduler = _scheduler(cost=_model())
+    scheduler = _scheduler(cost=_model(), _quadratic_cost=True)
     # Without in-flight steps above target_ms, 16K behind 16K clips to 12288.
     assert scheduler._mamba_block_aligned_split(_request(16384, 65536), 16384) == 12288
     # When an in-flight step in the wave already takes 260 ms, the next step
     # can fill to 16384 without slowing the lockstep wave.
-    scheduler = _scheduler(cost=_model())
+    scheduler = _scheduler(cost=_model(), _quadratic_cost=True)
     scheduler._inflight_ms = [260.0]
     assert scheduler._mamba_block_aligned_split(_request(16384, 65536), 16384) == 16384
+    # Without quadratic_cost the chunk keeps the model's own target.
+    scheduler = _scheduler(cost=_model())
+    scheduler._inflight_ms = [260.0]
+    assert scheduler._mamba_block_aligned_split(_request(16384, 65536), 16384) == 12288
 
 
 def test_running_srpf_orders_by_quadratic_effective_cost():
@@ -714,10 +724,11 @@ def test_running_srpf_orders_by_quadratic_effective_cost():
     # much higher than r_shallow at prefix 0.
     r_deep = _request(163840, 163840 + 3800, "deep")
     r_shallow = _request(0, 4096, "shallow")
-    scheduler = _scheduler(cost=model, running=[r_deep, r_shallow])
+    scheduler = _scheduler(
+        cost=model, running=[r_deep, r_shallow], _quadratic_cost=True
+    )
     scheduler._srpf_running = True
     scheduler._paw_aging_tok_per_s = 0.0
-    scheduler._paw_max_wait_s = 0.0
     with patch.object(Scheduler, "schedule", return_value=_EMPTY_STEP):
         scheduler.schedule()
     assert [r.request_id for r in scheduler.running] == ["shallow", "deep"]

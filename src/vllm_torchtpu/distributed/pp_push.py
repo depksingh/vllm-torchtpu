@@ -71,11 +71,12 @@ sampled it, and the next step then reaches stage 0 through the engine
 core's update, schedule and RPC and the worker's input preparation, a
 chain of some 10 ms that is exposed whenever the last stage finishes less
 than that before the slowest stage. Under the wave,
-``TPU_PP_EXTRA_STEPS_IN_FLIGHT`` adds that many steps to the count, so the
+``extra_steps_in_flight`` adds that many steps to the count, so the
 chain runs a wave earlier and stage 0's next forward is queued on its
 device behind the current one. The
 pushes a wait sends count the later steps that exist, so the deeper queue
-changes none of them.
+changes none of them. The count is the ``tpu_pp_scheduler`` option
+``extra_steps_in_flight`` (``core/pp_scheduler_options.py``), 0 by default.
 """
 
 import contextlib
@@ -85,7 +86,7 @@ from typing import Any, cast
 
 from vllm.logger import init_logger
 
-from vllm_torchtpu import envs
+from vllm_torchtpu.core import pp_scheduler_options
 
 logger = init_logger(__name__)
 
@@ -267,9 +268,10 @@ def ring_extra_steps(stages: int) -> int:
     return max(1, stages // 2)
 
 
-def extra_steps_in_flight() -> int:
-    """Steps the engine keeps in flight beyond the pipeline depth."""
-    return int(envs.TPU_PP_EXTRA_STEPS_IN_FLIGHT)
+def extra_steps_in_flight(vllm_config: Any) -> int:
+    """Steps the engine keeps in flight beyond the pipeline depth under the
+    wave (option ``tpu_pp_scheduler.extra_steps_in_flight``, default 0)."""
+    return pp_scheduler_options.get(vllm_config).extra_steps_in_flight
 
 
 def rpc_ring_chunks(stages: int, extra: int = 0) -> int:
@@ -325,7 +327,11 @@ def widen_message_rings(vllm_config: Any) -> None:
         return
     stages = int(vllm_config.parallel_config.pipeline_parallel_size)
     if stages > 1:
-        extra = ring_extra_steps(stages) if ring_handoff() else extra_steps_in_flight()
+        extra = (
+            ring_extra_steps(stages)
+            if ring_handoff()
+            else extra_steps_in_flight(vllm_config)
+        )
         _widen_rpc_ring(stages, extra)
         if extra:
             _raise_steps_in_flight(extra)
@@ -457,7 +463,7 @@ def patch_executor_for_pp_wave(vllm_config: Any) -> None:
     stages = int(vllm_config.parallel_config.pipeline_parallel_size)
     if stages <= 1:
         return
-    extra = extra_steps_in_flight()
+    extra = extra_steps_in_flight(vllm_config)
     _widen_rpc_ring(stages, extra)
     if extra > 0:
         _raise_steps_in_flight(extra)

@@ -212,8 +212,16 @@ def test_a_deeper_pipeline_widens_the_rings_a_shallower_one_keeps_them(queue):
     assert queue(1, 1).kwargs["max_chunks"] == 24
 
 
-def _config(pp):
-    return SimpleNamespace(parallel_config=SimpleNamespace(pipeline_parallel_size=pp))
+def _config(pp, extra_steps=None):
+    additional = (
+        None
+        if extra_steps is None
+        else {"tpu_pp_scheduler": {"extra_steps_in_flight": extra_steps}}
+    )
+    return SimpleNamespace(
+        parallel_config=SimpleNamespace(pipeline_parallel_size=pp),
+        additional_config=additional,
+    )
 
 
 def test_worker_side_widening_follows_the_pipeline_size(queue):
@@ -228,7 +236,7 @@ def test_patch_is_skipped_without_a_pipeline():
     pp_push.patch_executor_for_pp_wave(_config(1))
 
 
-def _install_on_fake_executor(monkeypatch, stages):
+def _install_on_fake_executor(monkeypatch, stages, extra_steps=None):
     from vllm.v1.executor import multiproc_executor
 
     class _FakeExecutor:
@@ -252,7 +260,7 @@ def _install_on_fake_executor(monkeypatch, stages):
             self.calls.append(("profile", {"args": (is_start, profile_prefix)}))
 
     monkeypatch.setattr(multiproc_executor, "MultiprocExecutor", _FakeExecutor)
-    pp_push.patch_executor_for_pp_wave(_config(stages))
+    pp_push.patch_executor_for_pp_wave(_config(stages, extra_steps))
     return _FakeExecutor()
 
 
@@ -459,6 +467,9 @@ def _bare_executor_cls(monkeypatch):
         def collective_rpc(self, method, **kwargs):
             self.calls.append((method, kwargs))
 
+        def profile(self, is_start=True, profile_prefix=None):
+            self.calls.append(("profile", {"args": (is_start, profile_prefix)}))
+
     monkeypatch.setattr(multiproc_executor, "MultiprocExecutor", _FakeExecutor)
     return _FakeExecutor
 
@@ -567,9 +578,25 @@ def test_the_listener_hears_every_push_and_settle():
 
 def test_extra_steps_in_flight_widen_the_rings(queue, monkeypatch):
     assert pp_push.rpc_ring_chunks(8, extra=1) == pp_push.rpc_ring_chunks(9)
-    monkeypatch.setattr(pp_push.envs, "TPU_PP_EXTRA_STEPS_IN_FLIGHT", 2)
-    pp_push._widen_rpc_ring(8, pp_push.extra_steps_in_flight())
+    assert pp_push.extra_steps_in_flight(_config(8)) == 0
+    pp_push._widen_rpc_ring(8, pp_push.extra_steps_in_flight(_config(8, 2)))
     assert queue(1, 1).kwargs["max_chunks"] == 48
+
+
+def test_the_worker_widens_its_rings_for_the_extra_steps(monkeypatch, queue):
+    from vllm.config import VllmConfig
+
+    # The worker raises vLLM's steps in flight once per process: start from
+    # vLLM's property, unmarked, and restore both afterwards.
+    monkeypatch.setattr(
+        VllmConfig, "max_concurrent_batches", VllmConfig.max_concurrent_batches
+    )
+    monkeypatch.setattr(VllmConfig, "_tpu_pp_extra_steps", None, raising=False)
+    monkeypatch.delattr(VllmConfig, "_tpu_pp_extra_steps")
+    pp_push.widen_message_rings(_config(8, 2))
+    assert queue(1, 1).kwargs["max_chunks"] == pp_push.rpc_ring_chunks(8, extra=2)
+    steps = VllmConfig.max_concurrent_batches.fget
+    assert steps(_engine_config(8, async_scheduling=False)) == 10
 
 
 def test_the_executor_patch_raises_the_queue_depth_when_asked(monkeypatch, queue):
@@ -580,8 +607,23 @@ def test_the_executor_patch_raises_the_queue_depth_when_asked(monkeypatch, queue
     )
     monkeypatch.setattr(VllmConfig, "_tpu_pp_extra_steps", None, raising=False)
     monkeypatch.delattr(VllmConfig, "_tpu_pp_extra_steps")
-    monkeypatch.setattr(pp_push.envs, "TPU_PP_EXTRA_STEPS_IN_FLIGHT", 1)
-    _install_on_fake_executor(monkeypatch, 8)
+    _install_on_fake_executor(monkeypatch, 8, extra_steps=1)
     steps = VllmConfig.max_concurrent_batches.fget
     assert steps(_engine_config(8, async_scheduling=False)) == 9
     assert queue(1, 1).kwargs["max_chunks"] == 44
+
+
+def test_the_executor_patch_keeps_vllms_queue_depth_by_default(monkeypatch, queue):
+    from vllm.config import VllmConfig
+
+    monkeypatch.setattr(
+        VllmConfig, "max_concurrent_batches", VllmConfig.max_concurrent_batches
+    )
+    monkeypatch.setattr(VllmConfig, "_tpu_pp_extra_steps", None, raising=False)
+    monkeypatch.delattr(VllmConfig, "_tpu_pp_extra_steps")
+    vllm_steps = VllmConfig.max_concurrent_batches.fget
+    _install_on_fake_executor(monkeypatch, 8)
+    steps = VllmConfig.max_concurrent_batches.fget
+    config = _engine_config(8, async_scheduling=False)
+    assert steps(config) == vllm_steps(config)
+    assert queue(1, 1).kwargs["max_chunks"] == pp_push.rpc_ring_chunks(8)
