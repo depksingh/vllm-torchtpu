@@ -13,6 +13,7 @@
 # limitations under the License.
 import re
 from collections.abc import Iterable
+from typing import cast
 
 import torch
 import torch.nn as nn
@@ -21,7 +22,10 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models.qwen3_dspark import DSparkMarkovHead
+from vllm.model_executor.models.qwen3_dspark import (
+    DSparkConfidenceHead,
+    DSparkMarkovHead,
+)
 from vllm.model_executor.models.utils import WeightsMapper, maybe_prefix
 
 from vllm_torchtpu.logger import init_logger
@@ -35,16 +39,17 @@ from vllm_torchtpu.models.vllm.deepseek_v4.model import (
 logger = init_logger(__name__)
 
 
-def _remap_dspark_name(name: str) -> str | None:
+def _remap_dspark_name(name: str, keep_confidence_head: bool = False) -> str | None:
     """Map a checkpoint ``mtp.{i}.*`` name to this model's parameter path.
-    Returns None for non-mtp weights (owned by the target model).
+    Returns None for non-mtp weights (owned by the target model), and for the
+    confidence head unless ``keep_confidence_head``.
     """
     m = re.match(r"mtp\.(\d+)\.(.*)", name)
     if m is None:
         return None
     stage = int(m.group(1))
     rest = m.group(2)
-    if rest.startswith("confidence_head."):
+    if rest.startswith("confidence_head.") and not keep_confidence_head:
         return None
     head_prefixes = (
         "norm.",
@@ -52,19 +57,22 @@ def _remap_dspark_name(name: str) -> str | None:
         "hc_head_base",
         "hc_head_scale",
         "markov_head.",
+        "confidence_head.",
     )
     if rest.startswith(("main_proj.", "main_norm.")) or rest.startswith(head_prefixes):
         return f"model.{rest}"
     return f"model.layers.{stage}.{rest}"
 
 
-def _rewrite_dspark_name(name: str, mapper: WeightsMapper) -> str | None:
+def _rewrite_dspark_name(
+    name: str, mapper: WeightsMapper, keep_confidence_head: bool = False
+) -> str | None:
     """Checkpoint name -> ``DeepseekV4Model`` parameter path.
 
     The DSpark remap first, then the target's own naming conventions:
     scale suffixes, gate bias, shared-expert rename.
     """
-    mapped = _remap_dspark_name(name)
+    mapped = _remap_dspark_name(name, keep_confidence_head)
     if mapped is None:
         return None
     mapped = mapper._map_name(mapped)
@@ -177,7 +185,7 @@ class DSparkDeepseekV4Model(nn.Module):
         # silently lose its earliest in-block keys. K + 1 rows covers the
         # DFlash 1 + K layout as well as the dense DSpark K layout.
         max_block_rows = vllm_config.speculative_config.num_speculative_tokens + 1
-        for layer in self.layers:
+        for layer in cast(Iterable[DeepseekV4DecoderLayer], self.layers):
             if max_block_rows > layer.attn.window_size:
                 raise ValueError(
                     f"DSpark draft block of up to {max_block_rows} rows "
@@ -213,6 +221,16 @@ class DSparkDeepseekV4Model(nn.Module):
             config.dspark_markov_rank,
             prefix=maybe_prefix(prefix, "markov_head"),
         )
+        # Only adaptive verification reads the confidence head; upstream's
+        # DSV4 DSpark defaults enable_confidence_head to True.
+        self.confidence_head: DSparkConfidenceHead | None = None
+        if vllm_config.speculative_config.enable_adaptive_verification and getattr(
+            config, "enable_confidence_head", True
+        ):
+            self.confidence_head = DSparkConfidenceHead(
+                config.hidden_size + config.dspark_markov_rank,
+                prefix=maybe_prefix(prefix, "confidence_head"),
+            )
 
     # Borrowed from the target: the lazily built MHC post op, the expert
     # mapping, and the per-layer loader.
@@ -235,7 +253,10 @@ class DSparkDeepseekV4Model(nn.Module):
         return [False] * len(self.layers)
 
     def get_draft_kv_cache_layer_names(self) -> list[str]:
-        return [layer.attn.swa_cache_layer.prefix for layer in self.layers]
+        return [
+            layer.attn.swa_cache_layer.prefix
+            for layer in cast(Iterable[DeepseekV4DecoderLayer], self.layers)
+        ]
 
     def precompute_and_store_context_kv(
         self,
@@ -249,7 +270,7 @@ class DSparkDeepseekV4Model(nn.Module):
         mirroring upstream; the paged insert goes through the TPU attention op.
         """
         main_x = self.combine_hidden_states(target_hidden_states)
-        for i, layer in enumerate(self.layers):
+        for i, layer in enumerate(cast(Iterable[DeepseekV4DecoderLayer], self.layers)):
             attn = layer.attn
             qr_kv, _ = attn.fused_wqa_wkv(main_x)
             kv = qr_kv[..., attn.mla_attn.q_lora_rank :]
@@ -361,6 +382,14 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
     def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
         return self.model.markov_head.bias(markov_embed, self.logits_processor)
 
+    def compute_confidence(
+        self, head_hidden: torch.Tensor, markov_embed: torch.Tensor
+    ) -> torch.Tensor:
+        """Per-position acceptance probability of each drafted token, from the
+        pre-norm head hidden and the previous token's Markov embedding."""
+        assert self.model.confidence_head is not None
+        return torch.sigmoid(self.model.confidence_head(head_hidden, markov_embed))
+
     # --- Weight loading -----------------------------------------------------
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -373,12 +402,13 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         mapper = _make_deepseek_v4_weights_mapper(
             getattr(self.config, "expert_dtype", "fp4")
         )
+        keep_confidence_head = self.model.confidence_head is not None
         model_params = dict(self.model.named_parameters())
         loaded: set[str] = set()
 
         def _layer_stream():
             for name, weight in weights:
-                mapped = _rewrite_dspark_name(name, mapper)
+                mapped = _rewrite_dspark_name(name, mapper, keep_confidence_head)
                 if mapped is None:
                     continue
                 if mapped.startswith("layers."):
@@ -392,5 +422,11 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                 loaded.add(mapped)
 
         loaded |= self.model.load_weights(_layer_stream())
+        if keep_confidence_head and not any(
+            name.startswith("confidence_head.") for name in loaded
+        ):
+            # Uninitialized weights would score drafts at random; without the
+            # head the proposer verifies every draft.
+            self.model.confidence_head = None
         logger.info("DSpark draft model loaded: %d params", len(loaded))
         return {f"model.{name}" for name in loaded}

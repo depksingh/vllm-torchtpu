@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from dataclasses import dataclass
 from typing import Any
 
@@ -6,6 +18,7 @@ import numpy as np
 import torch
 from vllm.v1.outputs import (
     AsyncModelRunnerOutput,
+    KVConnectorOutput,
     LogprobsLists,
     LogprobsTensors,
     ModelRunnerOutput,
@@ -112,6 +125,15 @@ class AsyncTPUCopyState:
             _spec_logprobs_tpu=spec_logprobs_tpu,
         )
 
+    def fence_pending_device_work(self) -> None:
+        """Re-arms the ready event behind everything enqueued on the device
+        since the copy was issued. A torch.tpu.Event covers all work
+        enqueued before it is recorded, so wait() then also proves that
+        later work (a drafter's KV writes) has executed."""
+        event = torch.tpu.Event()
+        event.record()
+        self.copy_ready_event = event
+
     def wait(self) -> None:
         if self.completed:
             return
@@ -208,9 +230,13 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
         self._model_runner_output.sampled_token_ids = valid_sampled_token_ids
         return self._model_runner_output
 
+    def get_kv_connector_output(self) -> KVConnectorOutput | None:
+        """Get the KV connector output for this async output."""
+        return self._model_runner_output.kv_connector_output
+
 
 def assemble_spec_next_tokens(
-    next_tokens: torch.Tensor, drafts: torch.Tensor, num_reqs: int
+    next_tokens: torch.Tensor, drafts: torch.Tensor, num_reqs: int | None = None
 ) -> torch.Tensor:
     """Async substitution source for speculative decoding.
 
@@ -225,10 +251,14 @@ def assemble_spec_next_tokens(
             prefix + bonus, padded with INVALID_TOKEN_ID); the bonus is the last
             non-padding column of each row.
         drafts: device proposer output ``[>=num_reqs, K]``.
-        num_reqs: real request count (both inputs may be bucket-padded in dim 0).
+        num_reqs: slice both inputs to this many rows, or None to keep the
+            bucketed rows (the runner's choice: the padded tail is never
+            addressed, and an exact slice would compile a program per count).
     """
-    nt = next_tokens[:num_reqs]
-    drafts = drafts[:num_reqs]
+    if num_reqs is not None:
+        next_tokens = next_tokens[:num_reqs]
+        drafts = drafts[:num_reqs]
+    nt = next_tokens
     # Last non-padding column per row is the bonus.
     last_valid_col = (nt != INVALID_TOKEN_ID).sum(dim=1).clamp(min=1) - 1
     bonus = nt.gather(1, last_valid_col.unsqueeze(1))  # [num_reqs, 1]

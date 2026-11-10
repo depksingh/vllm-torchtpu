@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Async MTP contracts across real scheduler, runner and TPU operations.
 
 No model weights are needed. Accelerator initialization is deferred to fixtures.
@@ -18,11 +30,14 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.worker import gpu_model_runner
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
+from vllm_torchtpu.runner.min_tokens import MinTokensTracker
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.runner.tpu_runner_async_output import (
     AsyncPreResults,
     AsyncTPUCopyState,
 )
+
+pytestmark = pytest.mark.tpu_test
 
 
 @pytest.fixture
@@ -49,6 +64,7 @@ def request_state(req_id, block, output=()):
 
 def make_runner(device, monkeypatch, k):
     runner = object.__new__(TPUModelRunner)
+    runner._min_tokens = MinTokensTracker()
     runner.device = device
     runner.speculative_config = (
         SimpleNamespace(num_speculative_tokens=k, use_ngram_gpu=lambda: False)
@@ -80,7 +96,6 @@ def make_runner(device, monkeypatch, k):
         device=torch.device("cpu"),
         vocab_size=512,
         block_sizes=[256],
-        kernel_block_sizes=[256],
         max_num_blocks_per_req=[8],
         num_spec_tokens=k,
     )
@@ -136,6 +151,8 @@ def cached_step(runner, req_ids, *, num_scheduled=4):
         ("unified", "new_owner", 2, 0),
         ("unified", "reuse_id", 2, 0),
         ("compact", "continue", 2, 2),
+        ("compact", "pause", 0, 0),
+        ("compact", "pause", 2, 2),
         ("compact", "new_owner", 2, 0),
         ("compact", "reuse_id", 2, 0),
     ],
@@ -143,7 +160,7 @@ def cached_step(runner, req_ids, *, num_scheduled=4):
 def test_mamba_read_offset_follows_storage_owner(
     device, monkeypatch, transition, offset, expected, layout
 ):
-    """Check offset ownership; compact pause needs separate state restoration."""
+    """A scheduling gap retains state ownership until KV is invalidated."""
     runner = make_runner(device, monkeypatch, 3)
     a = request_state("A", 5, [100, 101, 102])
     b = request_state("B", 9, [200])
@@ -158,7 +175,9 @@ def test_mamba_read_offset_follows_storage_owner(
     runner.cache_config = SimpleNamespace(block_size=256)
     runner._pending_mamba_state_copies = []
     runner._mamba_slot_stride = 4
-    runner.mamba_state_indices_cpu = torch.zeros(2, dtype=torch.int32)
+    runner._unfenced_h2d_sources = []
+    runner._free_h2d_sources = {}
+    runner._registered_h2d_sources = set()
     runner._init_mamba_slot_pool(9)
     if layout == "compact":
         runner._mamba_copy_plan = []
@@ -316,14 +335,42 @@ def test_bootstrap_commits_once_after_upstream_update(device, monkeypatch, k):
     )
 
 
-@pytest.mark.parametrize("k", [1, 3])
-@pytest.mark.parametrize("mode", ["pure", "mixed"])
-def test_proposed_drafts_reach_next_inputs(device, k, mode):
+def substitution_runner(device, k):
     runner = object.__new__(TPUModelRunner)
     runner.device = device
     runner.speculative_config = SimpleNamespace(num_speculative_tokens=k)
     runner._last_sequence_layout_plan = None
     runner._fast_token_substitution = False
+    return runner
+
+
+def substitute_next_inputs(runner, ids, assembled, num_scheduled):
+    """The next step's input ids once the parked device tokens replace its
+    placeholders. `assembled` is what an async assembler returned."""
+    chunks, _indices, rejected, counts = assembled
+    runner.input_batch = SimpleNamespace(req_ids=ids)
+    runner._pre_async_results = AsyncPreResults(
+        req_ids=ids,
+        next_tokens_tpu=torch.cat(chunks),
+        request_seq_lens=[],
+        discard_sampled_tokens_req_indices=[],
+        req_id_to_index_copy={rid: i for i, rid in enumerate(ids)},
+        spec_decode_num_rejected_tokens=rejected,
+        num_draft_per_req=counts,
+    )
+    dst, src = runner._prepare_async_token_substitution_indices(
+        0, len(ids), num_scheduled
+    )
+    placeholder_inputs = torch.full(
+        (int(num_scheduled.sum()),), -1, dtype=torch.int32, device=runner.device
+    )
+    return runner._apply_async_token_substitution(placeholder_inputs, dst, src).cpu()
+
+
+@pytest.mark.parametrize("k", [1, 3])
+@pytest.mark.parametrize("mode", ["pure", "mixed"])
+def test_proposed_drafts_reach_next_inputs(device, k, mode):
+    runner = substitution_runner(device, k)
     drafts = torch.tensor(
         [list(range(101, 101 + k)), list(range(201, 201 + k))],
         dtype=torch.int32,
@@ -344,37 +391,56 @@ def test_proposed_drafts_reach_next_inputs(device, k, mode):
                 None,
             ],
         )
-        chunks, _indices, rejected, counts = runner._assemble_async_spec_substitution(
+        assembled = runner._assemble_async_spec_substitution(
             drafts, [verified, newly_sampled], state
         )
         ids = ["verify", "new"]
     else:
         newly_sampled = torch.tensor([[200]], dtype=torch.int32, device=device)
-        chunks, _indices, rejected, counts = runner._assemble_async_prefill_bootstrap(
+        assembled = runner._assemble_async_prefill_bootstrap(
             drafts[1:], [newly_sampled], [1]
         )
         ids = ["new"]
 
-    runner.input_batch = SimpleNamespace(req_ids=ids)
-    source = torch.cat(chunks)
-    runner._pre_async_results = AsyncPreResults(
-        req_ids=ids,
-        next_tokens_tpu=source,
-        request_seq_lens=[],
-        discard_sampled_tokens_req_indices=[],
-        req_id_to_index_copy={rid: i for i, rid in enumerate(ids)},
-        spec_decode_num_rejected_tokens=rejected,
-        num_draft_per_req=counts,
+    replaced = substitute_next_inputs(
+        runner, ids, assembled, np.full(len(ids), 1 + k, dtype=np.int32)
     )
-    dst, src = runner._prepare_async_token_substitution_indices(
-        0, len(ids), np.full(len(ids), 1 + k, dtype=np.int32)
-    )
-    placeholder_inputs = torch.full(
-        (len(ids) * (1 + k),), -1, dtype=torch.int32, device=device
-    )
-    replaced = runner._apply_async_token_substitution(placeholder_inputs, dst, src)
-    actual = replaced.cpu().reshape(len(ids), 1 + k)[-1].tolist()
+    actual = replaced.reshape(len(ids), 1 + k)[-1].tolist()
     expected = [200] + list(range(201, 201 + k))
     assert actual == expected, (
         "a non-verify chunk must carry its real proposals into the next step"
     )
+
+
+@pytest.mark.parametrize("num_spec_tokens_to_schedule", [0, 1, 2])
+def test_dynamic_schedule_verifies_leading_drafts(device, num_spec_tokens_to_schedule):
+    """Async scheduling needs no drafter support for a dynamic speculative
+    decoding schedule: upstream sizes the next window from this step's K, and
+    substitution fills it with the first of the K drafts proposed."""
+    k = 3
+    request = Request(
+        "A", list(range(10)), SamplingParams(temperature=0, max_tokens=32), None
+    )
+    request.status = RequestStatus.RUNNING
+    scheduler = scheduler_for(request, k)
+    prefill = SchedulerOutput.make_empty()
+    prefill.num_scheduled_tokens = {"A": 10}
+    prefill.total_num_scheduled_tokens = 10
+    prefill.num_spec_tokens_to_schedule = num_spec_tokens_to_schedule
+    scheduler._update_after_schedule(prefill)
+    # How Scheduler.schedule() sizes a running request's next step.
+    num_scheduled = (
+        request.num_tokens_with_spec
+        + request.num_output_placeholders
+        - request.num_computed_tokens
+    )
+
+    runner = substitution_runner(device, k)
+    drafts = torch.tensor([[101, 102, 103]], dtype=torch.int32, device=device)
+    sampled = torch.tensor([[100]], dtype=torch.int32, device=device)
+    assembled = runner._assemble_async_prefill_bootstrap(drafts, [sampled], [1])
+    replaced = substitute_next_inputs(
+        runner, ["A"], assembled, np.array([num_scheduled], dtype=np.int32)
+    )
+    expected = [100, 101, 102, 103][: 1 + num_spec_tokens_to_schedule]
+    assert replaced.tolist() == expected

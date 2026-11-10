@@ -27,6 +27,13 @@ logger = init_logger(__name__)
 _ROUTER_TOPK = envs.TPU_MOE_ROUTER_TOPK
 
 
+def _get_topk_weights_dtype(default_dtype: torch.dtype) -> torch.dtype:
+    """Returns torch.float32 if TPU_MOE_TOPK_WEIGHTS_FLOAT32 is enabled,
+    else default_dtype.
+    """
+    return torch.float32 if envs.TPU_MOE_TOPK_WEIGHTS_FLOAT32 else default_dtype
+
+
 def _topk(scores: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
     """Top-k over the expert axis, by the configured implementation."""
     if _ROUTER_TOPK == "rowmax":
@@ -70,6 +77,24 @@ if _strategy_name:
     )
 
 
+def is_uniform_random_simulation() -> bool:
+    """Whether ``VLLM_MOE_ROUTING_SIMULATION_STRATEGY`` is ``uniform_random``."""
+    return _SIMULATION_STRATEGY is not None and _strategy_name == _UNIFORM_RANDOM
+
+
+def uniform_random_logits(router_logits: torch.Tensor) -> torch.Tensor:
+    """f32 uniform noise in ``[m, m + 1)``, ``m`` the mean of ``router_logits``.
+
+    Its top-k is a uniform-random expert draw (see ``_uniform_random_routing``
+    for the mean). The noise stays f32: in bf16, a few hundred experts' values
+    in ``[m, m + 1)`` collide and top-k breaks the ties toward low expert ids.
+    """
+    noise = torch.rand_like(router_logits, dtype=torch.float32)
+    # Anchor the noise to the activations. Uniform shift => same argsort =>
+    # identical expert choice; the point is the graph edge, not the value.
+    return noise + router_logits.float().mean()
+
+
 def _uniform_random_routing(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
@@ -92,15 +117,13 @@ def _uniform_random_routing(
     barrier) is deliberate -- it constrains scheduling without blocking
     optimization across the boundary the way ``optimization_barrier`` would.
     """
-    noise = torch.rand_like(router_logits, dtype=torch.float32)
-    # Anchor the noise to the activations. Uniform shift => same argsort =>
-    # identical expert choice; the point is the graph edge, not the value.
-    noise = noise + router_logits.float().mean()
-    _, topk_ids = torch.topk(noise, k=topk, dim=-1)
+    _, topk_ids = torch.topk(uniform_random_logits(router_logits), k=topk, dim=-1)
     topk_weights = torch.ones(
         (router_logits.shape[0], topk), dtype=torch.float32, device=router_logits.device
     )
-    return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
+    return topk_weights.to(_get_topk_weights_dtype(hidden_states.dtype)), topk_ids.to(
+        torch.int32
+    )
 
 
 def maybe_simulate_routing(
@@ -122,7 +145,7 @@ def maybe_simulate_routing(
     """
     if _SIMULATION_STRATEGY is None:
         return None
-    if _strategy_name == _UNIFORM_RANDOM:
+    if is_uniform_random_simulation():
         return _uniform_random_routing(hidden_states, router_logits, topk)
     topk_weights, topk_ids = _SIMULATION_STRATEGY.route_tokens(
         hidden_states=hidden_states,
@@ -130,7 +153,9 @@ def maybe_simulate_routing(
         top_k=topk,
         indices_type=torch.int32,
     )
-    return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
+    return topk_weights.to(_get_topk_weights_dtype(hidden_states.dtype)), topk_ids.to(
+        torch.int32
+    )
 
 
 def route(
@@ -247,6 +272,8 @@ def select_experts(
     )
     if hash_indices_table is not None and input_ids is not None:
         scores = _apply_scoring_fn(scoring_fn, router_logits.float())
+        # hash_indices_table is only set when layer is not None.
+        assert layer is not None
         routed_scaling_factor = layer.routed_scaling_factor
         topk_weights, topk_ids = _hash_moe_select(
             scores,
@@ -255,7 +282,9 @@ def select_experts(
             renormalize,
             routed_scaling_factor,
         )
-        return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
+        return topk_weights.to(
+            _get_topk_weights_dtype(hidden_states.dtype)
+        ), topk_ids.to(torch.int32)
 
     use_grouped = (
         layer is not None
@@ -268,6 +297,7 @@ def select_experts(
             grouped_topk,
         )
 
+        assert layer is not None
         topk_weights, topk_ids = grouped_topk(
             hidden_states=hidden_states,
             gating_output=router_logits,
@@ -279,7 +309,9 @@ def select_experts(
             routed_scaling_factor=layer.routed_scaling_factor,
             e_score_correction_bias=layer.e_score_correction_bias,
         )
-        return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
+        return topk_weights.to(
+            _get_topk_weights_dtype(hidden_states.dtype)
+        ), topk_ids.to(torch.int32)
 
     scores = _apply_scoring_fn(scoring_fn, router_logits.float())
     e_score_correction_bias = (
@@ -303,7 +335,9 @@ def select_experts(
     if routed_scaling_factor != 1.0:
         topk_weights = topk_weights * routed_scaling_factor
 
-    return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
+    return topk_weights.to(_get_topk_weights_dtype(hidden_states.dtype)), topk_ids.to(
+        torch.int32
+    )
 
 
 def get_experts_start(layer) -> int | None:

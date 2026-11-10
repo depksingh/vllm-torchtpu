@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Deviceless duck-typed tensor fakes for the Raiden pool-manifest tests.
 
 Moved out of tpu_connector_v2_test_utils.py so that collecting the live
@@ -56,20 +68,31 @@ class FakeTensor:
         return self._storage_offset
 
 
-def kimi_pool_manifest(heads, pool=None):
-    """The stock full K3 unified pool for a local KDA head count."""
+KIMI_KV_ITEMSIZE = {"bfloat16": 2, "float8_e4m3fn": 1}
+
+
+def kimi_pool_manifest(heads, pool=None, kv_dtype="bfloat16"):
+    """The stock full K3 unified pool for a local KDA head count.
+
+    ``kv_dtype`` is the pool's attention KV dtype. The KDA state regions are
+    sized the same for either: conv stays bf16 and SSM stays f32.
+    """
     from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
     from vllm_torchtpu.gdn_pool_layout import derive_pooled_gdn_state_layout
 
     state_shape = ((3, 3, heads, 128), (heads, 128, 128))
     layout = derive_pooled_gdn_state_layout(
         ssm_bytes=heads * 128 * 128 * 4,
-        conv_bytes=3 * 3 * heads * 128 * 2,
+        conv_bytes=3 * 3 * heads * 128 * 4,
         token_bytes=2560,
     )
     rows = layout.required_tokens
     if pool is None:
-        pool = FakeTensor((4, rows, 2, 640), 2, dtype="torch.bfloat16")
+        itemsize = KIMI_KV_ITEMSIZE[kv_dtype]
+        pool = FakeTensor(
+            (4, rows, 4 // itemsize, 640), itemsize, dtype=f"torch.{kv_dtype}"
+        )
+    packing = pool.shape[2]
     state_layer, fa_layer = "model.layers.1.kda", "model.layers.4.attn"
     groups = [
         types.SimpleNamespace(
@@ -83,7 +106,7 @@ def kimi_pool_manifest(heads, pool=None):
         types.SimpleNamespace(
             layer_names=[fa_layer],
             kv_cache_spec=types.SimpleNamespace(
-                block_size=rows * 2, page_size_bytes=rows * 2560
+                block_size=rows * packing, page_size_bytes=rows * 2560
             ),
         ),
     ]
@@ -246,7 +269,7 @@ def dsv4_materialization(*, num_blocks=16, tokens_per_page=256):
     # allocates them; everything overlaid on NoPE inherits that.
     csa_nope = [words(tokens) for _ in range(2)]
     csa_rope = [words(tokens // 4) for _ in range(2)]
-    indexer = [cache(tokens // 4, 256) for _ in range(2)]
+    indexer = [cache(33, 256) for _ in range(2)]
     hca = cache(tokens * 2, 128)
 
     csa_names = [f"model.layers.{i}.self_attn.attn" for i in range(2)]

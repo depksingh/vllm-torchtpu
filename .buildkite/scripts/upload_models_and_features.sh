@@ -20,6 +20,10 @@ BUILDKITE_DIR=".buildkite"
 MODEL_LIST_KEY="model-list"
 FEATURE_LIST_KEY="feature-list"
 
+# A TPU step in models/*.yml runs through the Kueue launcher with
+# SHAPE=${MODEL_SHAPE_MULTI} or ${MODEL_SHAPE_SINGLE}; each generation's group
+# below exports the pod shapes those name before its upload interpolates them.
+
 if [[ ! "${JOB_PRIORITY:-1}" =~ ^-?[0-9]+$ ]]; then
   echo "ERROR: JOB_PRIORITY must be an integer, got: '${JOB_PRIORITY:-}'"
   exit 1
@@ -78,7 +82,9 @@ for folder_path in "${TARGET_FOLDERS[@]}"; do
   while IFS= read -r -d '' yml_file; do
     echo "--- handling yml file: ${yml_file}"
 
-    # Use the first occurrence of CI_TARGET as the subject name
+    # Use the first occurrence of CI_TARGET as the subject name. Reset per
+    # file: one without CI_TARGET must not inherit the previous file's.
+    subject_name=""
     subject_name_line=$(grep -m 1 "^[[:space:]]*CI_TARGET:" "${yml_file}" || true)
 
     if [[ -n "$subject_name_line" ]]; then
@@ -129,8 +135,8 @@ fi
 if [[ "${#pipeline_v6e_fragments[@]}" -gt 0 ]]; then
   echo "--- Uploading TPU v6e Pipeline Group"
   # Export v6e specific variables
-  export TPU_QUEUE_SINGLE="tpu_v6e_queue"
-  export TPU_QUEUE_MULTI="tpu_v6e_8_queue"
+  export MODEL_SHAPE_SINGLE="ct6e-standard-1t/1x1"
+  export MODEL_SHAPE_MULTI="ct6e-standard-8t/2x4"
   export TPU_VERSION="tpu6e"
   export TENSOR_PARALLEL_SIZE_SINGLE=1
   export TENSOR_PARALLEL_SIZE_MULTI=8
@@ -152,8 +158,8 @@ fi
 if [[ "${#pipeline_v7x_fragments[@]}" -gt 0 ]]; then
   echo "--- Uploading TPU v7x Pipeline Group"
   # Export v7x specific variables
-  export TPU_QUEUE_SINGLE="tpu_v7x_2_queue"
-  export TPU_QUEUE_MULTI="tpu_v7x_8_queue"
+  export MODEL_SHAPE_SINGLE="tpu7x-standard-1t/1x1x1"
+  export MODEL_SHAPE_MULTI="tpu7x-standard-4t/2x2x1"
   export TPU_VERSION="tpu7x"
   export TENSOR_PARALLEL_SIZE_SINGLE=2
   export TENSOR_PARALLEL_SIZE_MULTI=8

@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Temporal chunking of the vision encoder over video frames.
 
 Encoding a long video in one shot makes the vision flash-attention kernel
@@ -25,7 +37,7 @@ unmodified.
 
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -50,18 +62,29 @@ _VIDEO_GRID_KEYS = ("video_grid_thw", "grid_thw")
 _UNSET = object()
 
 
-def get_video_chunk_patch_size(model_config: "ModelConfig | None") -> int:
+def get_video_chunk_patch_size(
+    model_config: "ModelConfig | None",
+    default_max_patches: int = 0,
+) -> int:
     """Return the per-forward patch budget, or 0 when chunking is disabled.
 
     Args:
         model_config: Model configuration, optionally containing multimodal
             settings.
+        default_max_patches: Optional fallback/ceiling patch budget (e.g.,
+            derived from `MMEncoderManager`'s largest compiled bucket).
+            When both `MM_ENCODER_FRAME_CHUNK_PATCH_SIZE` and
+            `default_max_patches` are positive, the smaller value is used.
 
     Returns:
         The maximum number of patches allowed per forward, or 0 when
         chunking is disabled.
     """
-    max_patches = envs.MM_ENCODER_FRAME_CHUNK_PATCH_SIZE
+    env_max_patches = envs.MM_ENCODER_FRAME_CHUNK_PATCH_SIZE
+    if env_max_patches > 0 and default_max_patches > 0:
+        max_patches = min(env_max_patches, default_max_patches)
+    else:
+        max_patches = max(env_max_patches, default_max_patches, 0)
     if max_patches <= 0:
         return 0
 
@@ -102,7 +125,7 @@ def chunked_video_encoding(
         yield
         return
 
-    def chunked_embed_multimodal(**mm_kwargs: object) -> "MultiModalEmbeddings":
+    def chunked_embed_multimodal(**mm_kwargs: Any) -> "MultiModalEmbeddings":
         return embed_multimodal_chunked(embed_fn, mm_kwargs, max_patches)
 
     previous = model.__dict__.get("embed_multimodal", _UNSET)
@@ -119,7 +142,7 @@ def chunked_video_encoding(
 
 def embed_multimodal_chunked(
     embed_fn: Callable[..., "MultiModalEmbeddings"],
-    mm_kwargs: dict[str, object],
+    mm_kwargs: dict[str, Any],
     max_patches: int,
 ) -> "MultiModalEmbeddings":
     """Run `embed_fn` on multimodal kwargs, splitting large videos into chunks.
@@ -229,7 +252,7 @@ def _encode_video_item(
     embed_fn: Callable[..., "MultiModalEmbeddings"],
     pixel_key: str,
     grid_key: str,
-    item_kwargs: dict[str, object],
+    item_kwargs: dict[str, Any],
     max_patches: int,
 ) -> torch.Tensor:
     """Encode one video item, splitting into chunks when patch count exceeds budget.
@@ -302,7 +325,7 @@ def _encode_video_item(
     return torch.cat(chunk_outs, dim=0)
 
 
-def _select_item_timestamps(timestamps: object, i: int) -> object:
+def _select_item_timestamps(timestamps: Any, i: int) -> Any:
     """Select item `i`'s timestamps from a batched group.
 
     Batching stacks a fixed-length timestamps tensor to `[num_items, T]` and
@@ -325,7 +348,7 @@ def _select_item_timestamps(timestamps: object, i: int) -> object:
     return timestamps
 
 
-def _slice_timestamps(timestamps: object, start: int, end: int) -> object:
+def _slice_timestamps(timestamps: Any, start: int, end: int) -> Any:
     """Slice a per-temporal-patch timestamps field to `[start, end)`.
 
     The vision encoder itself ignores timestamps, but the input schema may

@@ -50,8 +50,13 @@ in the allowlist and stay unfiltered.
 
 import functools
 import gc
+import json
 import os
-from collections.abc import Generator
+import struct
+import threading
+import time
+import typing
+from collections.abc import Callable, Generator
 from concurrent.futures import ThreadPoolExecutor
 
 import torch
@@ -63,32 +68,54 @@ logger = init_logger(__name__)
 
 # Suffixes of per-expert tensors that are safe to skip for non-local
 # experts. Anything else (dense, shared experts, gate, norms) is fetched by
-# every rank.
-_EXPERT_WEIGHT_SUFFIXES = (".weight", ".weight_packed", ".weight_scale")
+# every rank. ``.scale`` is DeepSeek-V4's per-expert block scale
+# (``ffn.experts.<e>.w1.scale``), 47 GiB across all 384 experts.
+_EXPERT_WEIGHT_SUFFIXES = (".weight", ".weight_packed", ".weight_scale", ".scale")
+
+# Set to ``source.is_unused_weight`` while ``DefaultModelLoader._get_weights_iterator``
+# runs, so ``_should_skip_weight_tpu`` skips those tensors before ``get_tensor``.
+_unused_weight_predicate: Callable[[str], bool] | None = None
 
 
 def _should_skip(name: str, local_expert_ids: set[int]) -> bool:
     from vllm.model_executor.model_loader.ep_weight_filter import parse_expert_id
+
+    from vllm_torchtpu.layers.adapter import expert_placement
 
     expert_id = parse_expert_id(name)
     if expert_id is None:
         return False
     if not name.endswith(_EXPERT_WEIGHT_SUFFIXES):
         return False
+    if expert_placement.has_applied_layers():
+        # The placement's rank list for this tensor's layer, at the EP rank the
+        # layer's expert map was built for -- so the fetch and the expert map
+        # agree by construction, whatever derived that rank.
+        placed = expert_placement.fetch_filter_ids(name)
+        if placed is not None:
+            return expert_id not in placed
     return expert_id not in local_expert_ids
 
 
-def _should_skip_weight_tpu(name: str, local_expert_ids: set[int] | None) -> bool:
+def _should_skip_weight_tpu(
+    weight_name: str, local_expert_ids: set[int] | None
+) -> bool:
     """Drop-in replacement for vLLM's ``should_skip_weight``.
 
     Same contract as upstream (``local_expert_ids=None`` means no
     filtering), but the suffix allowlist also covers the compressed-tensors
     MXFP4 ``.weight_packed`` and ``.weight_scale`` names, so non-local
-    experts are skipped before their bytes are read.
+    experts are skipped before their bytes are read. Also skips weights
+    marked unused by the loading model's ``is_unused_checkpoint_weight``.
     """
+    if _unused_weight_predicate is not None and _unused_weight_predicate(weight_name):
+        # Unused by the loading model (e.g. MTP draft). Used tensors still
+        # go through the EP check below.
+        return True
     if local_expert_ids is None:
         return False
-    return _should_skip(name, local_expert_ids)
+    # EP weight filter: non-local expert.
+    return _should_skip(weight_name, local_expert_ids)
 
 
 def _compute_local_expert_ids() -> set[int] | None:
@@ -123,6 +150,8 @@ def _compute_local_expert_ids() -> set[int] | None:
         get_tensor_model_parallel_rank,
     )
 
+    from vllm_torchtpu import utils
+
     dp_size = parallel_config.data_parallel_size
     tp_size = parallel_config.tensor_parallel_size
     pcp_size = parallel_config.prefill_context_parallel_size
@@ -130,7 +159,13 @@ def _compute_local_expert_ids() -> set[int] | None:
     tp_rank = get_tensor_model_parallel_rank() if tp_size > 1 else 0
     pcp_rank = get_pcp_group().rank_in_group if pcp_size > 1 else 0
     ep_size = dp_size * pcp_size * tp_size
-    ep_rank = dp_rank * pcp_size * tp_size + pcp_rank * tp_size + tp_rank
+    ep_rank = utils.ep_rank(
+        dp_rank=dp_rank,
+        pcp_rank=pcp_rank,
+        pcp_size=pcp_size,
+        tp_rank=tp_rank,
+        tp_size=tp_size,
+    )
 
     # Use the loader's symbol instead of importing the base helper directly.
     # Hierarchical EP replaces this symbol with its chip-aware ownership map,
@@ -154,17 +189,78 @@ def _compute_local_expert_ids() -> set[int] | None:
     return local_ids
 
 
+class _OnlineFp8LayerFinisher:
+    """Quantizes each decoder layer after all its checkpoint tensors are consumed."""
+
+    def __init__(self, model: torch.nn.Module, names: list[str]) -> None:
+        from vllm_torchtpu.layers.adapter.quantization.fp8 import (
+            VllmFp8LinearMethodTPU,
+        )
+
+        # Checkpoint names keyed as the loader reads them, valued as the
+        # module paths they land in.
+        mapper = getattr(model, "hf_to_vllm_mapper", None)
+        targets: dict[str, str] = {}
+        for name in names:
+            mapped = [name] if mapper is None else mapper.apply_list([name])
+            if mapped:
+                targets[name] = mapped[0]
+        self._layers: dict[
+            str, list[tuple[torch.nn.Module, VllmFp8LinearMethodTPU]]
+        ] = {}
+        self._pending: dict[str, set[str]] = {}
+        self._owners: dict[str, str] = {}
+        for prefix, module in model.named_modules():
+            if not prefix.rsplit(".", 1)[-1].isdigit():
+                continue
+            selected = []
+            for child in module.modules():
+                method = getattr(child, "quant_method", None)
+                if isinstance(method, VllmFp8LinearMethodTPU) and method.online_fp8:
+                    selected.append((child, method))
+            if not selected:
+                continue
+            expected = {
+                name
+                for name, target in targets.items()
+                if target.startswith(prefix + ".")
+            }
+            if not expected:
+                continue
+            self._layers[prefix] = selected
+            self._pending[prefix] = expected
+            self._owners.update((name, prefix) for name in expected)
+
+    def consumed(self, name: str) -> None:
+        prefix = self._owners.pop(name, None)
+        if prefix is None:
+            return
+        pending = self._pending[prefix]
+        pending.remove(name)
+        if pending:
+            return
+        for layer, method in self._layers.pop(prefix):
+            method.process_weights_after_loading(layer)
+        del self._pending[prefix]
+        logger.info("[sharded-ep-load] completed online FP8 for %s", prefix)
+
+
 def _sharded_runai_weights_iterator(
     hf_weights_files: list[str],
     local_expert_ids: set[int],
     use_tqdm_on_load: bool,
+    model: torch.nn.Module | None = None,
+    is_unused_weight: Callable[[str], bool] | None = None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Stream only this rank's tensors from the safetensors files.
 
     Reads each file's safetensors header (via the Run:AI streamer, so
     ``gs://`` and local paths both work), drops non-local expert tensors
+    (and any checkpoint weights rejected by ``is_unused_weight``)
     from the request plan, and streams the surviving byte ranges as
     contiguous runs. The skipped bytes are never requested from storage.
+    With ``model``, each decoder layer's online-FP8 linears are quantized
+    as soon as the layer's tensors have been delivered.
     """
     import runai_model_streamer.safetensors_streamer.safetensors_pytorch as sp
     from runai_model_streamer.file_streamer import FileChunks
@@ -198,14 +294,20 @@ def _sharded_runai_weights_iterator(
         def _flush(path: str) -> None:
             nonlocal run_start, run_sizes, run_tensors
             if run_sizes:
-                requests.append(FileChunks(len(requests), path, run_start, run_sizes))
+                # run_start is set whenever a size is appended to run_sizes.
+                assert run_start is not None
+                requests.append(
+                    FileChunks.contiguous(len(requests), path, run_start, run_sizes)
+                )
                 tensors_by_request.append(run_tensors)
             run_start, run_sizes, run_tensors = None, [], []
 
         for path, meta in zip(hf_weights_files, metas):
             pos = meta.offset
             for tensor_meta, size in zip(meta.tensors_metadata, meta.read_sizes):
-                if _should_skip(tensor_meta.name, local_expert_ids):
+                if _should_skip(tensor_meta.name, local_expert_ids) or (
+                    is_unused_weight is not None and is_unused_weight(tensor_meta.name)
+                ):
                     skipped += 1
                     skipped_bytes += size
                     # A zero-byte skip leaves the byte stream contiguous, so
@@ -234,6 +336,12 @@ def _sharded_runai_weights_iterator(
             skipped,
             skipped_bytes / 1e9,
         )
+
+        finisher = None
+        if model is not None:
+            names = [t.name for group in tensors_by_request for t in group]
+            names.extend(t.name for t in zero_size_tensors)
+            finisher = _OnlineFp8LayerFinisher(model, names)
 
         fs.stream_files(requests, credentials=None, device="cpu", is_distributed=False)
 
@@ -270,6 +378,8 @@ def _sharded_runai_weights_iterator(
                     tensor_meta.name,
                     sp.create_torch_tensor(memoryview(b""), tensor_meta),
                 )
+                if finisher is not None:
+                    finisher.consumed(tensor_meta.name)
                 progress.update(1)
             for yielded, (request_id, chunk_index, buffer) in enumerate(
                 fs.get_chunks(), start=1
@@ -279,6 +389,8 @@ def _sharded_runai_weights_iterator(
                     tensor_meta.name,
                     sp.create_torch_tensor(buffer, tensor_meta).clone(),
                 )
+                if finisher is not None:
+                    finisher.consumed(tensor_meta.name)
                 progress.update(1)
                 if sync_every and yielded % sync_every == 0:
                     _device_sync()
@@ -286,6 +398,43 @@ def _sharded_runai_weights_iterator(
             progress.close()
         if sync_every:
             _device_sync()
+
+
+def _patch_runai_local_rank_discovery() -> None:
+    """Reuse the exported host-rank count instead of rediscovering it.
+
+    Every ``SafetensorsStreamer`` instance runs
+    ``_distributedStreamerParams.find_local_ranks``, which opens a process
+    group over the whole world and all-gathers hostnames, so a load that
+    only some ranks perform (the last pipeline stage loading its MTP draft)
+    waits on the absent ranks until the store timeout. The first load in a
+    process exports RUNAI_STREAMER_PROCESS_GROUP_SIZE from its discovery;
+    later streamers read it back and skip the collective.
+    """
+    try:
+        from runai_model_streamer.distributed_streamer import (
+            distributed_streamer as rds,
+        )
+
+        params_cls = rds._distributedStreamerParams
+    except (ImportError, AttributeError):
+        logger.info_once(
+            "[sharded-ep-load] runai streamer without host-rank discovery; "
+            "nothing to patch."
+        )
+        return
+    if getattr(params_cls, "_tpu_discovery_patch", False):
+        return
+    original_find_local_ranks = params_cls.find_local_ranks
+
+    def find_local_ranks(self):
+        size = os.environ.get("RUNAI_STREAMER_PROCESS_GROUP_SIZE")
+        if size is None or not torch.distributed.is_initialized():
+            return original_find_local_ranks(self)
+        return int(size), torch.distributed.get_rank(), []
+
+    params_cls.find_local_ranks = find_local_ranks
+    params_cls._tpu_discovery_patch = True
 
 
 def patch_runai_sharded_expert_streaming() -> None:
@@ -300,9 +449,23 @@ def patch_runai_sharded_expert_streaming() -> None:
 
     if getattr(rsl.RunaiModelStreamerLoader, "_tpu_sharded_ep_patch", False):
         return
+    _patch_runai_local_rank_discovery()
     original_get_iterator = rsl.RunaiModelStreamerLoader._get_weights_iterator
+    original_load_weights = rsl.RunaiModelStreamerLoader.load_weights
 
-    def _get_weights_iterator(self, model_or_path: str, revision: str | None):
+    def load_weights(self, model, model_config):
+        self._loading_model = model
+        try:
+            return original_load_weights(self, model, model_config)
+        finally:
+            self._loading_model = None
+
+    def _get_weights_iterator(
+        self,
+        model_or_path: str,
+        revision: str | None,
+        is_unused_weight: Callable[[str], bool] | None = None,
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
         try:
             local_expert_ids = _compute_local_expert_ids()
         except AttributeError:
@@ -320,7 +483,9 @@ def patch_runai_sharded_expert_streaming() -> None:
             )
             local_expert_ids = None
         if local_expert_ids is None:
-            return original_get_iterator(self, model_or_path, revision)
+            return original_get_iterator(
+                self, model_or_path, revision, is_unused_weight
+            )
         if getattr(self, "_is_distributed", False):
             # Per-rank fetch plans differ, so the streamer's cross-rank
             # broadcast mode would corrupt the chunk-id maps. Sharded
@@ -330,11 +495,19 @@ def patch_runai_sharded_expert_streaming() -> None:
                 "'distributed': incompatible with per-rank sharded fetch "
                 "plans; streaming per rank instead."
             )
+        # The sharded iterator reads every shard header and skips unused
+        # tensors itself, so a shard of only unused tensors costs no fetch.
         hf_weights_files = self._prepare_weights(model_or_path, revision)
         return _sharded_runai_weights_iterator(
-            hf_weights_files, local_expert_ids, self.load_config.use_tqdm_on_load
+            hf_weights_files,
+            local_expert_ids,
+            self.load_config.use_tqdm_on_load,
+            self._loading_model,
+            is_unused_weight=is_unused_weight,
         )
 
+    rsl.RunaiModelStreamerLoader._loading_model = None
+    rsl.RunaiModelStreamerLoader.load_weights = load_weights
     rsl.RunaiModelStreamerLoader._get_weights_iterator = _get_weights_iterator
     rsl.RunaiModelStreamerLoader._tpu_sharded_ep_patch = True
     logger.info(
@@ -353,18 +526,177 @@ def patch_default_loader_ep_weight_filter() -> None:
     predicate by value, so both module references are replaced. Inert when
     the EP weight filter is off: ``safetensors_weights_iterator`` then
     passes ``local_expert_ids=None`` and the predicate keeps everything.
+
+    The same predicate also skips tensors the loading model marks unused
+    (``model.is_unused_checkpoint_weight``, e.g. an MTP draft's main-model
+    weights). Upstream only uses that hook to drop whole shards and reads
+    every tensor of the shards it keeps. ``safetensors_weights_iterator``
+    does not take the hook, so ``_get_weights_iterator`` is wrapped to hold
+    it in ``_unused_weight_predicate`` while its iterator runs.
     """
-    from vllm.model_executor.model_loader import ep_weight_filter, weight_utils
+    from vllm.model_executor.model_loader import (
+        default_loader,
+        ep_weight_filter,
+        weight_utils,
+    )
 
     if getattr(weight_utils, "_tpu_ep_filter_patch", False):
         return
     weight_utils.should_skip_weight = _should_skip_weight_tpu
     ep_weight_filter.should_skip_weight = _should_skip_weight_tpu
+
+    # With the filter on, upstream's "prefetch" strategy still reads whole
+    # files: rank r reads sorted_files[r::world_size] in full, every expert
+    # included. Under EP across hosts that pulls the other hosts' experts into
+    # this host's page cache, while the files another host's ranks prefetched
+    # are read here through mmap page faults. Prefetch only the byte ranges of
+    # the tensors this rank keeps instead, across every file.
+    original_iterator = weight_utils.safetensors_weights_iterator
+
+    @functools.wraps(original_iterator)
+    def safetensors_weights_iterator(
+        hf_weights_files,
+        use_tqdm_on_load,
+        safetensors_load_strategy=None,
+        local_expert_ids=None,
+        **kwargs,
+    ):
+        if safetensors_load_strategy == "prefetch" and local_expert_ids is not None:
+            _start_ep_range_prefetch(
+                sorted(hf_weights_files, key=weight_utils._natural_sort_key),
+                local_expert_ids,
+                kwargs.get(
+                    "safetensors_prefetch_num_threads",
+                    weight_utils.DEFAULT_SAFETENSORS_PREFETCH_NUM_THREADS,
+                ),
+                kwargs.get(
+                    "safetensors_prefetch_block_size",
+                    weight_utils.DEFAULT_SAFETENSORS_PREFETCH_BLOCK_SIZE,
+                ),
+            )
+            safetensors_load_strategy = "lazy"
+        elif safetensors_load_strategy is None and _unused_weight_predicate is not None:
+            # Auto mode prefetches whole files on NFS/Lustre, unused tensors
+            # included. Lazy reads only the tensors that are not skipped.
+            safetensors_load_strategy = "lazy"
+        return original_iterator(
+            hf_weights_files,
+            use_tqdm_on_load,
+            safetensors_load_strategy,
+            local_expert_ids,
+            **kwargs,
+        )
+
+    original_get_weights_iterator = (
+        default_loader.DefaultModelLoader._get_weights_iterator
+    )
+
+    @functools.wraps(original_get_weights_iterator)
+    def _get_weights_iterator(self, source):
+        is_unused = source.is_unused_weight
+        if is_unused is None:
+            return original_get_weights_iterator(self, source)
+
+        def _iter_skipping_unused():
+            global _unused_weight_predicate
+            prev = _unused_weight_predicate
+            _unused_weight_predicate = is_unused
+            try:
+                yield from original_get_weights_iterator(self, source)
+            finally:
+                _unused_weight_predicate = prev
+
+        return _iter_skipping_unused()
+
+    weight_utils.safetensors_weights_iterator = safetensors_weights_iterator
+    default_loader.safetensors_weights_iterator = safetensors_weights_iterator
+    default_loader.DefaultModelLoader._get_weights_iterator = _get_weights_iterator
     weight_utils._tpu_ep_filter_patch = True
     logger.info(
         "Applied TPU patch: EP weight filter covers "
-        ".weight_packed/.weight_scale (DefaultModelLoader)."
+        ".weight_packed/.weight_scale/.scale, skips unused checkpoint "
+        "tensors before read, and prefetch reads only "
+        "local tensors (DefaultModelLoader)."
     )
+
+
+def _local_tensor_ranges(
+    path: str, local_expert_ids: set[int]
+) -> list[tuple[int, int]]:
+    """Merged [start, end) file offsets of the tensors this rank keeps."""
+    with open(path, "rb") as f:
+        (header_len,) = struct.unpack("<Q", f.read(8))
+        header = json.loads(f.read(header_len))
+    base = 8 + header_len
+    spans = sorted(
+        (base + v["data_offsets"][0], base + v["data_offsets"][1])
+        for name, v in header.items()
+        if name != "__metadata__" and not _should_skip(name, local_expert_ids)
+    )
+    merged: list[list[int]] = []
+    for start, end in spans:
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return [(start, end) for start, end in merged]
+
+
+def _start_ep_range_prefetch(
+    sorted_files: list[str],
+    local_expert_ids: set[int],
+    num_threads: int,
+    block_size: int,
+) -> None:
+    """Read this rank's tensors into the page cache in a background thread.
+
+    Reads go in the iterator's file order, in ``block_size`` chunks over
+    ``num_threads`` threads, so the lazy safetensors iterator that follows
+    finds its pages cached. Dense tensors are kept by every rank; ranks on
+    one host share those pages.
+    """
+
+    def run() -> None:
+        start = time.perf_counter()
+        fds: list[int] = []
+        jobs: list[tuple[int, int, int]] = []
+        try:
+            for path in sorted_files:
+                fd = os.open(path, os.O_RDONLY)
+                fds.append(fd)
+                for lo, hi in _local_tensor_ranges(path, local_expert_ids):
+                    jobs.extend(
+                        (fd, off, min(block_size, hi - off))
+                        for off in range(lo, hi, block_size)
+                    )
+            with ThreadPoolExecutor(max_workers=num_threads) as executor:
+                total = sum(
+                    executor.map(lambda j: len(os.pread(j[0], j[2], j[1])), jobs)
+                )
+            elapsed = time.perf_counter() - start
+            logger.info(
+                "[ep-prefetch] read %.1f GiB of local tensors from %d files in "
+                "%.1f s (%.2f GiB/s)",
+                total / 2**30,
+                len(sorted_files),
+                elapsed,
+                total / 2**30 / max(elapsed, 1e-9),
+            )
+        except Exception:
+            logger.warning("[ep-prefetch] prefetch failed", exc_info=True)
+        finally:
+            for fd in fds:
+                os.close(fd)
+
+    logger.info(
+        "[ep-prefetch] started: %d files, %d local experts, num_threads=%d, "
+        "block_size=%d bytes",
+        len(sorted_files),
+        len(local_expert_ids),
+        num_threads,
+        block_size,
+    )
+    threading.Thread(target=run, name="ep-range-prefetch", daemon=True).start()
 
 
 def _evict_one_checkpoint_file(fpath: str) -> float | None:
@@ -430,7 +762,9 @@ def patch_default_model_loader_page_cache() -> None:
         return
 
     original_prepare_weights = dl.DefaultModelLoader._prepare_weights
-    original_load_weights = dl.DefaultModelLoader.load_weights
+    original_load_weights = typing.cast(
+        Callable[..., None], dl.DefaultModelLoader.load_weights
+    )
 
     def _prepare_weights(self, *args, **kwargs):
         res = original_prepare_weights(self, *args, **kwargs)
@@ -610,6 +944,7 @@ class ExpertParamStager:
     def flush_all(self) -> None:
         for param, _ in list(self._staged.values()):
             self.flush(param)
+        self._pool.clear()
 
     def __len__(self) -> int:
         return len(self._staged)
@@ -708,3 +1043,32 @@ def patch_moe_expert_write_staging() -> None:
         "Applied TPU patch: expert parameters are staged on the host "
         "and written to the device once each."
     )
+
+
+def patch_expert_placement_routers() -> None:
+    """Renumber placed MoE layers' routers after every model's weights load.
+
+    TPU_EXPERT_PLACEMENT loads a placed layer's experts in slot order
+    (``expert_placement.apply``, from the TPU MoE runner). Its router has to
+    be renumbered the same way once the checkpoint is written and before
+    process_weights_after_loading stages anything derived from it. Every model
+    a loader builds, a drafter included, passes through here between the two,
+    so no model needs code of its own.
+    """
+    from vllm.model_executor.model_loader import base_loader
+
+    orig_process = base_loader.process_weights_after_loading
+    if getattr(orig_process, "_tpu_renumbers_expert_routers", False):
+        return
+
+    @functools.wraps(orig_process)
+    def process_weights_after_loading(model, model_config, target_device):
+        from vllm_torchtpu.layers.adapter import expert_placement
+
+        expert_placement.permute_routers(model)
+        return orig_process(model, model_config, target_device)
+
+    typing.cast(
+        typing.Any, process_weights_after_loading
+    )._tpu_renumbers_expert_routers = True
+    base_loader.process_weights_after_loading = process_weights_after_loading

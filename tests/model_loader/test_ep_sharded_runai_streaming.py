@@ -202,11 +202,11 @@ def test_request_plan_groups_contiguous_kept_runs():
         )
 
     requests = captured["requests"]
-    assert [(r.offset, r.chunks) for r in requests] == [
-        (1000, [10, 2]),  # expert 0's contiguous run
-        (1024, [7]),  # dense weight after the skipped gap
+    assert [(r.offsets, r.sizes) for r in requests] == [
+        ([1000, 1010], [10, 2]),  # expert 0's contiguous run
+        ([1024], [7]),  # dense weight after the skipped gap
     ]
-    total_requested = sum(sum(r.chunks) for r in requests)
+    total_requested = sum(sum(r.sizes) for r in requests)
     assert total_requested == 19  # 31 bytes in file, 12 skipped
 
 
@@ -273,7 +273,7 @@ def test_zero_size_kept_tensor_bypasses_fetch_plan():
 
     requests = captured["requests"]
     # One contiguous run through the zero-byte tensor; no 0-length chunk.
-    assert [(r.offset, r.chunks) for r in requests] == [(100, [8, 4])]
+    assert [(r.offsets, r.sizes) for r in requests] == [([100, 108], [8, 4])]
     # The zero-size tensor is still yielded (as an empty tensor).
     assert "m.layers.0.empty.weight" in yielded
 
@@ -281,8 +281,8 @@ def test_zero_size_kept_tensor_bypasses_fetch_plan():
 def test_streamer_split_preserves_chunk_index_mapping():
     """Pin the library contract this loader depends on: when
     RUNAI_STREAMER_MEMORY_LIMIT forces FilesRequestsIterator to split one
-    FileChunks across several sub-requests, get_global_file_and_chunk must
-    keep reporting (our request id, index within OUR chunk list)."""
+    FileChunks across several sub-requests, get_global_file_and_range must
+    keep reporting (our request id, index within OUR range list)."""
     # The Run:AI streamer ships with PR #331; skip until it is in the image.
     pytest.importorskip("runai_model_streamer")
     from runai_model_streamer.file_streamer.requests_iterator import (
@@ -292,7 +292,7 @@ def test_streamer_split_preserves_chunk_index_mapping():
 
     # One request of 5 chunks, memory limit 6 -> split into [3,3],[3,3],[3]
     chunks = [3, 3, 3, 3, 3]
-    it = FilesRequestsIterator(6, [FileChunks(7, "/f", 100, list(chunks))])
+    it = FilesRequestsIterator(6, [FileChunks.contiguous(7, "/f", 100, list(chunks))])
 
     seen = []
     while True:
@@ -300,9 +300,9 @@ def test_streamer_split_preserves_chunk_index_mapping():
         if req is None:
             break
         for local_file_idx, fc in enumerate(req.files):
-            for local_chunk_idx in range(len(fc.chunks)):
-                file_id, global_idx = it.get_global_file_and_chunk(
-                    local_file_idx, local_chunk_idx
+            for local_range_idx in range(len(fc.sizes)):
+                file_id, global_idx = it.get_global_file_and_range(
+                    req, local_file_idx, local_range_idx
                 )
                 seen.append((file_id, global_idx))
     assert seen == [(7, i) for i in range(len(chunks))]
@@ -319,6 +319,7 @@ def test_patch_falls_back_when_filter_inactive():
 
     class FakeLoader:
         _get_weights_iterator = original
+        load_weights = MagicMock(name="original_load_weights")
 
     with patch.object(rsl, "RunaiModelStreamerLoader", FakeLoader):
         mlp.patch_runai_sharded_expert_streaming()
@@ -329,4 +330,159 @@ def test_patch_falls_back_when_filter_inactive():
         with patch.object(mlp, "_compute_local_expert_ids", return_value=None):
             loader = FakeLoader()
             FakeLoader._get_weights_iterator(loader, "gs://b/m", None)
-        original.assert_called_once_with(loader, "gs://b/m", None)
+        original.assert_called_once_with(loader, "gs://b/m", None, None)
+
+
+def test_patch_forwards_is_unused_weight_when_filter_active():
+    """With EP sharding active, _get_weights_iterator forwards every shard and
+    is_unused_weight to _sharded_runai_weights_iterator, which skips unused
+    tensors from the shard headers without a separate file pre-filter."""
+    from vllm.model_executor.model_loader import runai_streamer_loader as rsl
+
+    from vllm_torchtpu import model_loader_patches as mlp
+
+    class FakeLoader:
+        _get_weights_iterator = MagicMock(name="original_get_weights_iterator")
+        load_weights = MagicMock(name="original_load_weights")
+        load_config = SimpleNamespace(use_tqdm_on_load=False)
+
+        def _prepare_weights(self, model_or_path, revision):
+            return ["gs://b/m/shard0.safetensors", "gs://b/m/shard1.safetensors"]
+
+    unused_fn = lambda name: name.startswith("unused.")  # noqa: E731
+    with (
+        patch.object(rsl, "RunaiModelStreamerLoader", FakeLoader),
+        patch.object(rsl, "is_runai_obj_uri", return_value=True),
+        patch.object(rsl, "_filter_remote_weights") as mock_filter,
+        patch.object(mlp, "_compute_local_expert_ids", return_value={0}),
+        patch.object(mlp, "_sharded_runai_weights_iterator") as mock_sharded_iter,
+    ):
+        mlp.patch_runai_sharded_expert_streaming()
+        loader = FakeLoader()
+        FakeLoader._get_weights_iterator(loader, "gs://b/m", "main", unused_fn)
+        mock_filter.assert_not_called()
+        mock_sharded_iter.assert_called_once_with(
+            ["gs://b/m/shard0.safetensors", "gs://b/m/shard1.safetensors"],
+            {0},
+            False,
+            None,
+            is_unused_weight=unused_fn,
+        )
+
+
+def test_layer_finisher_runs_after_consumer_receives_tensor():
+    pytest.importorskip("runai_model_streamer")
+    import runai_model_streamer.safetensors_streamer.safetensors_pytorch as sp
+    import torch
+    from runai_model_streamer.safetensors_streamer import safetensors_streamer
+
+    from vllm_torchtpu import model_loader_patches as mlp
+
+    names = ["model.layers.0.q.weight", "model.layers.0.v.weight"]
+    metadata = _fake_file_meta(100, [(name, 4) for name in names])
+    received, finalized = [], []
+    model = torch.nn.Module()
+
+    class FakeFinisher:
+        def __init__(self, actual_model, actual_names):
+            assert actual_model is model
+            assert actual_names == names
+
+        def consumed(self, name):
+            assert received[-1] == name
+            finalized.append(name)
+
+    class FakeStreamer:
+        def __init__(self):
+            self.file_streamer = self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def stream_files(self, *args, **kwargs):
+            pass
+
+        def get_chunks(self):
+            return iter([(0, 0, b"1234"), (0, 1, b"5678")])
+
+    with (
+        patch.object(safetensors_streamer, "SafetensorsStreamer", FakeStreamer),
+        patch.object(sp.SafetensorsMetadata, "from_files", return_value=[metadata]),
+        patch.object(sp, "create_torch_tensor", return_value=torch.ones(1)),
+        patch.object(mlp, "_OnlineFp8LayerFinisher", FakeFinisher),
+        patch.object(mlp.envs, "TPU_SHARDED_LOAD_SYNC_EVERY", 0),
+    ):
+        for name, _ in _sharded_runai_weights_iterator(
+            ["gs://b/m"], {0}, False, model=model
+        ):
+            assert name not in finalized
+            received.append(name)
+    assert finalized == names
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_loading_model_is_scoped_to_load_weights(fail):
+    import torch
+    from vllm.model_executor.model_loader import runai_streamer_loader as rsl
+
+    from vllm_torchtpu import model_loader_patches as mlp
+
+    model = torch.nn.Module()
+
+    class FakeLoader:
+        _get_weights_iterator = MagicMock()
+
+        def load_weights(self, actual_model, model_config):
+            assert self._loading_model is actual_model
+            if fail:
+                raise RuntimeError("load failed")
+
+    with patch.object(rsl, "RunaiModelStreamerLoader", FakeLoader):
+        mlp.patch_runai_sharded_expert_streaming()
+        loader = FakeLoader()
+        assert loader._loading_model is None
+        if fail:
+            with pytest.raises(RuntimeError, match="load failed"):
+                loader.load_weights(model, None)
+        else:
+            loader.load_weights(model, None)
+    assert loader._loading_model is None
+
+
+def test_local_rank_discovery_reuses_exported_group_size(monkeypatch):
+    pytest.importorskip("runai_model_streamer")
+    from runai_model_streamer.distributed_streamer import (
+        distributed_streamer as rds,
+    )
+
+    from vllm_torchtpu import model_loader_patches as mlp
+
+    mlp._patch_runai_local_rank_discovery()
+    mlp._patch_runai_local_rank_discovery()  # idempotent
+    params = rds._distributedStreamerParams()
+    monkeypatch.setenv("RUNAI_STREAMER_PROCESS_GROUP_SIZE", "8")
+    with (
+        patch("torch.distributed.is_initialized", return_value=True),
+        patch("torch.distributed.get_rank", return_value=5),
+        patch("torch.distributed.new_group", side_effect=AssertionError("collective")),
+    ):
+        assert params.find_local_ranks() == (8, 5, [])
+    monkeypatch.delenv("RUNAI_STREAMER_PROCESS_GROUP_SIZE")
+    with patch("torch.distributed.is_initialized", return_value=False):
+        assert params.find_local_ranks() == (1, 0, [[0]])
+
+
+def test_ep_rank_is_dp_major_over_dp_pcp_tp():
+    """The EP rank the loader and TPU_DP_VOCAB_PARALLEL both assume."""
+    from vllm_torchtpu import utils
+
+    ranks = [
+        utils.ep_rank(dp_rank=d, pcp_rank=p, pcp_size=2, tp_rank=t, tp_size=3)
+        for d in range(2)
+        for p in range(2)
+        for t in range(3)
+    ]
+    assert ranks == list(range(12))
