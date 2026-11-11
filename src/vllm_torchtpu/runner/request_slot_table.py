@@ -19,8 +19,8 @@ when ``sample_tokens()`` begins. Stateful sampling adapters (such as
 ``thinking_token_budget``, token penalties, or ``bad_words``) can own a
 ``RequestSlotTable`` to maintain fixed-shape ``[max_num_reqs + 1, num_cols]``
 per-request state on device (with slot ``0`` reserved as an untracked sentinel),
-release slots across unscheduled waves, and reuse cached ``slot_ids`` H2D
-uploads across steady-state decode steps.
+release slots across unscheduled waves, and reuse cached per-chunk
+``slot_ids`` H2D uploads across steady-state decode steps.
 """
 
 from collections.abc import Callable, Container, Iterable, Sequence
@@ -32,42 +32,27 @@ import torch
 from vllm_torchtpu.layers.adapter.sample.scatter_ops import seed_slot_rows
 
 
-def same_target_device(actual: torch.device, requested: torch.device) -> bool:
-    """Match e.g. ``device('tpu', 0)`` against unindexed ``device('tpu')``."""
-    if actual.type != requested.type:
-        return False
-    if requested.index is not None:
-        return actual.index == requested.index
-    if actual.index is None:
-        return True
-    default_idx = (
-        torch.accelerator.current_device_index()
-        if torch.accelerator.is_available()
-        and (acc := torch.accelerator.current_accelerator()) is not None
-        and acc.type == requested.type
-        else 0
-    )
-    return actual.index == default_idx
-
-
 class RequestSlotTable[RowT: Sequence[int]]:
     """Request-ID-keyed ``[max_num_reqs + 1, num_cols]`` int32 device-slot pool.
 
     Slot ``0`` is a permanent untracked sentinel row; slots ``1..max_num_reqs``
     are leased to active requests in ``input_batch`` and released when requests
-    finish, are preempted, or rotate out in unscheduled waves.
+    finish, are preempted, or rotate out in unscheduled waves. The table lives
+    on ``device`` and is allocated on first use.
     """
 
     def __init__(
         self,
         max_num_reqs: int,
         num_cols: int,
+        device: torch.device,
         sentinel_row: Sequence[int] | None = None,
     ) -> None:
         self._max_num_reqs = max(int(max_num_reqs), 1)
         self._num_cols = int(num_cols)
         if self._num_cols <= 0:
             raise ValueError(f"num_cols must be positive, got {num_cols}")
+        self._device = device
         default_row = (
             tuple(int(v) for v in sentinel_row)
             if sentinel_row is not None
@@ -83,11 +68,17 @@ class RequestSlotTable[RowT: Sequence[int]]:
         self._free_slots: list[int] = list(range(self._capacity - 1, 0, -1))
         self._dirty_rows: dict[str, RowT] = {}
         self._table: torch.Tensor | None = None
-        self._last_slot_ids: tuple[tuple[int, bytes], torch.Tensor] | None = None
+        # Last slot-ID upload per chunk (start_idx, width) with the host bytes
+        # it came from, so every chunk of a multi-chunk step reuses its own.
+        self._slot_ids_cache: dict[tuple[int, int], tuple[bytes, torch.Tensor]] = {}
 
     @property
     def max_num_reqs(self) -> int:
         return self._max_num_reqs
+
+    @property
+    def device(self) -> torch.device:
+        return self._device
 
     # Read-only slot/table introspection for unit tests and stateful adapters.
     @property
@@ -106,16 +97,13 @@ class RequestSlotTable[RowT: Sequence[int]]:
     def commit_table(self, table: torch.Tensor) -> None:
         self._table = table
 
-    def ensure_table(self, device: torch.device) -> torch.Tensor:
-        if self._table is None or not same_target_device(self._table.device, device):
-            if self._table is not None:
-                self._slot_by_req_id.clear()
-                self._free_slots = list(range(self._capacity - 1, 0, -1))
-                self._last_slot_ids = None
+    def ensure_table(self) -> torch.Tensor:
+        if self._table is None:
             sentinel_np = np.tile(
                 np.asarray(self._sentinel_row, dtype=np.int32), (self._capacity, 1)
             )
-            self._table = torch.from_numpy(sentinel_np).to(device)
+            self._table = torch.from_numpy(sentinel_np).to(self._device)
+            self._slot_ids_cache.clear()
         return self._table
 
     def mark_dirty(self, req_id: str, row: RowT) -> None:
@@ -150,16 +138,12 @@ class RequestSlotTable[RowT: Sequence[int]]:
         self,
         batch_req_ids: Iterable[str | None],
         tracked_req_ids: Container[str],
-        device: torch.device | None = None,
     ) -> bool:
         """Return True if ``sync_step`` will invoke ``compute_cold_row``."""
-        slots_valid = self._table is None or (
-            device is None or same_target_device(self._table.device, device)
-        )
         return any(
             req_id is not None
             and req_id in tracked_req_ids
-            and (not slots_valid or req_id not in self._slot_by_req_id)
+            and req_id not in self._slot_by_req_id
             and req_id not in self._dirty_rows
             for req_id in batch_req_ids
         )
@@ -178,7 +162,6 @@ class RequestSlotTable[RowT: Sequence[int]]:
 
     def sync_step(
         self,
-        device: torch.device,
         batch_req_ids: Sequence[str | None],
         tracked_req_ids: Container[str],
         compute_cold_row: Callable[[str], RowT],
@@ -195,7 +178,7 @@ class RequestSlotTable[RowT: Sequence[int]]:
             return None
 
         self.release_unscheduled(set(batch_tracked))
-        table = self.ensure_table(device)
+        table = self.ensure_table()
         to_seed: list[tuple[int, RowT]] = []
         for req_id in batch_tracked:
             had_slot = req_id in self._slot_by_req_id
@@ -221,15 +204,14 @@ class RequestSlotTable[RowT: Sequence[int]]:
                 # buffers would risk reading freed host memory in TorchTPU.
                 table = seed_slot_rows(
                     table,
-                    torch.from_numpy(slots_np).to(device),
-                    torch.from_numpy(vals_np).to(device),
+                    torch.from_numpy(slots_np).to(self._device),
+                    torch.from_numpy(vals_np).to(self._device),
                 )
             self._table = table
         return table
 
     def build_chunk_slot_ids(
         self,
-        device: torch.device,
         batch_req_ids: Sequence[str | None],
         start_idx: int,
         end_idx: int,
@@ -259,29 +241,24 @@ class RequestSlotTable[RowT: Sequence[int]]:
             any_active = True
         if not any_active:
             return None
-        key = (width, slots_np.tobytes())
-        prev = self._last_slot_ids
-        if (
-            prev is not None
-            and prev[0] == key
-            and same_target_device(prev[1].device, device)
-        ):
-            return prev[1]
-        dev = torch.from_numpy(slots_np).to(device)
-        self._last_slot_ids = (key, dev)
+        key = (start_idx, width)
+        slots_bytes = slots_np.tobytes()
+        cached = self._slot_ids_cache.get(key)
+        if cached is not None and cached[0] == slots_bytes:
+            return cached[1]
+        dev = torch.from_numpy(slots_np).to(self._device)
+        self._slot_ids_cache[key] = (slots_bytes, dev)
         return dev
 
-    def precompile(
-        self, device: torch.device, sync_fn: Callable[..., None]
-    ) -> torch.Tensor:
+    def precompile(self, sync_fn: Callable[..., None]) -> torch.Tensor:
         """Warm ``seed_slot_rows`` at ``[max_num_reqs]`` width."""
-        table = self.ensure_table(device)
-        seed_slots = torch.zeros(self._max_num_reqs, dtype=torch.int32).to(device)
+        table = self.ensure_table()
+        seed_slots = torch.zeros(self._max_num_reqs, dtype=torch.int32).to(self._device)
         seed_vals = np.tile(
             np.asarray(self._sentinel_row, dtype=np.int32), (self._max_num_reqs, 1)
         )
         table = seed_slot_rows(
-            table, seed_slots, torch.from_numpy(seed_vals).to(device)
+            table, seed_slots, torch.from_numpy(seed_vals).to(self._device)
         )
         sync_fn(table)
         self._table = table

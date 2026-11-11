@@ -50,11 +50,11 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-
-def _prefix_1d(values: torch.Tensor, num_rows: int) -> torch.Tensor:
-    if values.shape[0] == num_rows:
-        return values
-    return values[:num_rows]
+# ``force_logits_rows`` or ``force_token_ids``: (rows, forced_ids) ->
+# (forced rows, did_force).
+type ForceRowsFn = Callable[
+    [torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]
+]
 
 
 def _compute_request_state(
@@ -92,11 +92,13 @@ class ThinkingBudgetTracker:
         self,
         reasoning_config: ReasoningConfig | None,
         max_num_reqs: int,
+        device: torch.device,
     ) -> None:
         self._markers = ThinkingBudgetMarkers.from_reasoning_config(reasoning_config)
         self._slots: RequestSlotTable[StateTuple] = RequestSlotTable(
             max_num_reqs=max_num_reqs,
             num_cols=NUM_STATE_COLS,
+            device=device,
             sentinel_row=UNTRACKED_STATE,
         )
         self._budgets: dict[str, int] = {}
@@ -123,9 +125,6 @@ class ThinkingBudgetTracker:
 
     def __bool__(self) -> bool:
         return self._markers is not None and bool(self._budgets)
-
-    def commit_state_table(self, state_table: torch.Tensor) -> None:
-        self._slots.commit_table(state_table)
 
     def discard(self, req_ids: Iterable[str]) -> None:
         if not self._budgets:
@@ -172,19 +171,14 @@ class ThinkingBudgetTracker:
             ),
         )
 
-    def needs_output_reseed(
-        self,
-        batch_req_ids: Iterable[str | None],
-        device: torch.device | None = None,
-    ) -> bool:
+    def needs_output_reseed(self, batch_req_ids: Iterable[str | None]) -> bool:
         """Return True if ``prepare_step`` will read ``output_token_ids``."""
         if self._markers is None or not self._budgets:
             return False
-        return self._slots.needs_cold_reseed(batch_req_ids, self._budgets, device)
+        return self._slots.needs_cold_reseed(batch_req_ids, self._budgets)
 
     def step_state(
         self,
-        device: torch.device,
         batch_req_ids: Sequence[str | None],
         requests: Mapping[str, CachedRequestState],
         discard_req_ids: AbstractSet[str],
@@ -194,7 +188,7 @@ class ThinkingBudgetTracker:
             return None
         markers = self._markers
         assert markers is not None
-        state_table = self.prepare_step(device, batch_req_ids, requests)
+        state_table = self.prepare_step(batch_req_ids, requests)
         if state_table is None:
             return None
         return ThinkingBudgetStepState(self, state_table, markers, discard_req_ids)
@@ -217,16 +211,14 @@ class ThinkingBudgetTracker:
 
     def prepare_step(
         self,
-        device: torch.device,
         batch_req_ids: Sequence[str | None],
         requests: Mapping[str, CachedRequestState],
     ) -> torch.Tensor | None:
-        """Ensure all scheduled budgeted requests own seeded slots on ``device``."""
+        """Ensure all scheduled budgeted requests own seeded slots."""
         if self._markers is None or not self._budgets:
             return None
         markers = self._markers
         return self._slots.sync_step(
-            device=device,
             batch_req_ids=batch_req_ids,
             tracked_req_ids=self._budgets,
             compute_cold_row=lambda req_id: _compute_request_state(
@@ -234,28 +226,8 @@ class ThinkingBudgetTracker:
             ),
         )
 
-    def build_chunk_slot_ids(
-        self,
-        device: torch.device,
-        batch_req_ids: Sequence[str | None],
-        start_idx: int,
-        end_idx: int,
-        padded_num_reqs: int | None = None,
-        discard_req_ids: AbstractSet[str] | None = None,
-    ) -> torch.Tensor | None:
-        """Build ``[padded_num_reqs]`` int32 slot IDs for ``[start_idx, end_idx)``."""
-        return self._slots.build_chunk_slot_ids(
-            device=device,
-            batch_req_ids=batch_req_ids,
-            start_idx=start_idx,
-            end_idx=end_idx,
-            padded_num_reqs=padded_num_reqs,
-            discard_req_ids=discard_req_ids,
-        )
-
     def precompile(
         self,
-        device: torch.device,
         num_reqs_paddings: Sequence[int],
         verify_logits_paddings: Sequence[int],
         max_draft_tokens: int,
@@ -269,22 +241,25 @@ class ThinkingBudgetTracker:
         markers = self._markers
         kernel_args = markers.kernel_args()
         max_reqs = self.max_num_reqs
-        state_table = self._slots.precompile(device, sync_fn)
+        device = self._slots.device
+        state_table = self._slots.precompile(sync_fn)
 
         slot_ids_full = torch.zeros(max_reqs, dtype=torch.int32).to(device)
         forced_full = tb_kernels.query_forced_tokens(
-            state_table, slot_ids_full, markers.end_ids
+            state_table, slot_ids_full, markers.natural_end_ids, markers.end_ids
         )
         sync_fn(forced_full)
 
         has_spec_verify = max_draft_tokens > 0 and bool(verify_logits_paddings)
-        warmed_logit_rows: set[int] = set()
+        # (rows, forced_ids length) of the warmed force_logits_rows and
+        # force_token_ids graphs. Plain and bonus rows pass the [max_reqs]
+        # slot-width forced IDs; verify target rows pass [num_tokens] ones.
+        warmed_force_shapes: set[tuple[int, int]] = set()
         for num_reqs in num_reqs_paddings:
-            warmed_logit_rows.add(num_reqs)
-            forced_req = _prefix_1d(forced_full, num_reqs)
+            warmed_force_shapes.add((num_reqs, max_reqs))
             selected = torch.zeros((num_reqs, 1), dtype=torch.int64).to(device)
             masked_plain, _ = tb_kernels.force_logits_rows(
-                dummy_logits_fn(num_reqs), forced_req
+                dummy_logits_fn(num_reqs), forced_full
             )
             state_table = tb_kernels.advance_plain_states(
                 state_table, slot_ids_full, selected, *kernel_args
@@ -298,7 +273,7 @@ class ThinkingBudgetTracker:
                 if has_spec_verify:
                     out_bonus_toks, _ = tb_kernels.force_token_ids(
                         torch.zeros(num_reqs, dtype=torch.int64).to(device),
-                        forced_req,
+                        forced_full,
                     )
                     to_sync.append(out_bonus_toks)
             if has_spec_verify:
@@ -339,8 +314,8 @@ class ThinkingBudgetTracker:
                     torch.zeros(num_tokens, dtype=torch.bool).to(device),
                 )
                 verify_sync: list[torch.Tensor] = [forced_bonus, eff_drafts]
-                if num_tokens not in warmed_logit_rows:
-                    warmed_logit_rows.add(num_tokens)
+                if (num_tokens, num_tokens) not in warmed_force_shapes:
+                    warmed_force_shapes.add((num_tokens, num_tokens))
                     out_logits, _ = tb_kernels.force_logits_rows(
                         dummy_logits_fn(num_tokens), forced_tgt
                     )
@@ -366,18 +341,16 @@ class ThinkingBudgetStepState:
     discard_req_ids: AbstractSet[str]
 
     def commit(self) -> None:
-        self.tracker.commit_state_table(self.state_table)
+        self.tracker.slots.commit_table(self.state_table)
 
     def chunk_slot_ids(
         self,
-        device: torch.device,
         batch_req_ids: Sequence[str | None],
         start_idx: int,
         end_idx: int,
         padded_num_reqs: int | None = None,
     ) -> torch.Tensor | None:
-        return self.tracker.build_chunk_slot_ids(
-            device=device,
+        return self.tracker.slots.build_chunk_slot_ids(
             batch_req_ids=batch_req_ids,
             start_idx=start_idx,
             end_idx=end_idx,
@@ -388,11 +361,13 @@ class ThinkingBudgetStepState:
     def mask_plain_logits(
         self, logits: torch.Tensor, slot_ids: torch.Tensor
     ) -> torch.Tensor:
-        forced_full = tb_kernels.query_forced_tokens(
-            self.state_table, slot_ids, self.markers.end_ids
+        forced_ids = tb_kernels.query_forced_tokens(
+            self.state_table,
+            slot_ids,
+            self.markers.natural_end_ids,
+            self.markers.end_ids,
         )
-        forced_rows = _prefix_1d(forced_full, logits.shape[0])
-        masked_logits, _ = tb_kernels.force_logits_rows(logits, forced_rows)
+        masked_logits, _ = tb_kernels.force_logits_rows(logits, forced_ids)
         return masked_logits
 
     def advance_plain(
@@ -420,24 +395,22 @@ class ThinkingBudgetStepState:
 
     def plain_chunk(
         self,
-        device: torch.device,
         batch_req_ids: Sequence[str | None],
         start_idx: int,
         end_idx: int,
     ) -> ThinkingBudgetPlainChunk | None:
-        slot_ids = self.chunk_slot_ids(device, batch_req_ids, start_idx, end_idx)
+        slot_ids = self.chunk_slot_ids(batch_req_ids, start_idx, end_idx)
         if slot_ids is None:
             return None
         return ThinkingBudgetPlainChunk(self, slot_ids)
 
     def spec_chunk(
         self,
-        device: torch.device,
         batch_req_ids: Sequence[str | None],
         start_idx: int,
         end_idx: int,
     ) -> ThinkingBudgetSpecChunk | None:
-        slot_ids = self.chunk_slot_ids(device, batch_req_ids, start_idx, end_idx)
+        slot_ids = self.chunk_slot_ids(batch_req_ids, start_idx, end_idx)
         if slot_ids is None:
             return None
         return ThinkingBudgetSpecChunk(self, slot_ids)
@@ -467,6 +440,33 @@ class ThinkingBudgetSpecChunk:
     step: ThinkingBudgetStepState
     slot_ids: torch.Tensor
 
+    def _force_targets_and_bonus(
+        self,
+        force_fn: ForceRowsFn,
+        targets: torch.Tensor,
+        bonus: torch.Tensor,
+        draft_token_ids: torch.Tensor,
+        segment_ids: torch.Tensor,
+        group_indices: torch.Tensor,
+        max_draft_tokens: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Force target and bonus rows with ``force_fn``; invalidate drafts."""
+        forced_tgt, forced_bonus = tb_kernels.prepare_spec_verify_drafts(
+            self.step.state_table,
+            self.slot_ids,
+            draft_token_ids,
+            segment_ids,
+            group_indices,
+            max_draft_tokens,
+            *self.step.markers.kernel_args(),
+        )
+        targets, did_force = force_fn(targets, forced_tgt)
+        effective_drafts = tb_kernels.invalidate_forced_drafts(
+            draft_token_ids, forced_tgt, did_force
+        )
+        bonus, _ = force_fn(bonus, forced_bonus)
+        return targets, bonus, effective_drafts
+
     def prepare_logits(
         self,
         target_logits: torch.Tensor,
@@ -476,24 +476,15 @@ class ThinkingBudgetSpecChunk:
         group_indices: torch.Tensor,
         max_draft_tokens: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        forced_tgt, forced_bonus_full = tb_kernels.prepare_spec_verify_drafts(
-            self.step.state_table,
-            self.slot_ids,
+        return self._force_targets_and_bonus(
+            tb_kernels.force_logits_rows,
+            target_logits,
+            bonus_logits,
             draft_token_ids,
             segment_ids,
             group_indices,
             max_draft_tokens,
-            *self.step.markers.kernel_args(),
         )
-        target_logits, did_force = tb_kernels.force_logits_rows(
-            target_logits, forced_tgt
-        )
-        effective_drafts = tb_kernels.invalidate_forced_drafts(
-            draft_token_ids, forced_tgt, did_force
-        )
-        forced_bonus = _prefix_1d(forced_bonus_full, bonus_logits.shape[0])
-        bonus_logits, _ = tb_kernels.force_logits_rows(bonus_logits, forced_bonus)
-        return target_logits, bonus_logits, effective_drafts
 
     def prepare_tokens(
         self,
@@ -504,22 +495,15 @@ class ThinkingBudgetSpecChunk:
         group_indices: torch.Tensor,
         max_draft_tokens: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        forced_tgt, forced_bonus_full = tb_kernels.prepare_spec_verify_drafts(
-            self.step.state_table,
-            self.slot_ids,
+        return self._force_targets_and_bonus(
+            tb_kernels.force_token_ids,
+            target_argmax,
+            bonus_token_ids,
             draft_token_ids,
             segment_ids,
             group_indices,
             max_draft_tokens,
-            *self.step.markers.kernel_args(),
         )
-        target_argmax, did_force = tb_kernels.force_token_ids(target_argmax, forced_tgt)
-        effective_drafts = tb_kernels.invalidate_forced_drafts(
-            draft_token_ids, forced_tgt, did_force
-        )
-        forced_bonus = _prefix_1d(forced_bonus_full, bonus_token_ids.shape[0])
-        bonus_token_ids, _ = tb_kernels.force_token_ids(bonus_token_ids, forced_bonus)
-        return target_argmax, bonus_token_ids, effective_drafts
 
     def finish(self, next_tokens: torch.Tensor, max_draft_tokens: int) -> None:
         self.step.state_table = tb_kernels.advance_spec_states(

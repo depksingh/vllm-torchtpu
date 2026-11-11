@@ -77,7 +77,7 @@ def _runner(seen, speculative=False):
         _mtp_prefill_only=False,
         _greedy_head_owner=None,
         _thinking_budget=ThinkingBudgetTracker(
-            _reasoning_config(), max_num_reqs=PADDINGS[-1]
+            _reasoning_config(), max_num_reqs=PADDINGS[-1], device=torch.device("cpu")
         ),
     )
     # The real helper; without a speculative config it yields no verify rows.
@@ -131,7 +131,11 @@ def test_flag_starts_each_local_rank_at_its_share_of_the_sweep(
 
 @pytest.mark.parametrize("rank", [0, 3, 7, 11])
 def test_thinking_budget_verify_logits_sweep_rotation(monkeypatch, rank):
-    verify_only = [n for n in VERIFY_PADDINGS if n not in PADDINGS]
+    # Plain rows force with the [max_num_reqs] slot-width IDs and verify target
+    # rows with [num_tokens] ones, so a verify bucket reuses a plain bucket's
+    # force_logits_rows graph only at num_tokens == max_num_reqs.
+    max_reqs = PADDINGS[-1]
+    verify_only = [n for n in VERIFY_PADDINGS if n != max_reqs]
     assert _sweep(
         monkeypatch,
         TPUModelRunner._precompile_thinking_budget,
@@ -151,7 +155,7 @@ def test_thinking_budget_verify_logits_sweep_rotation(monkeypatch, rank):
     ) == (
         PADDINGS[req_start:]
         + PADDINGS[:req_start]
-        + [n for n in rot_ver if n not in PADDINGS]
+        + [n for n in rot_ver if n != max_reqs]
     )
 
 
@@ -256,7 +260,11 @@ def test_rotated_sweeps_hold_no_collective():
         torch.zeros((n, thinking_budget.NUM_STATE_COLS), dtype=torch.int32),
     )
     graphs += _trace(
-        thinking_budget.query_forced_tokens, state_table, slot_ids, markers.end_ids
+        thinking_budget.query_forced_tokens,
+        state_table,
+        slot_ids,
+        markers.natural_end_ids,
+        markers.end_ids,
     )
     graphs += _trace(thinking_budget.force_logits_rows, logits, forced_ids)
     graphs += _trace(thinking_budget.force_token_ids, tokens_1d, forced_ids)

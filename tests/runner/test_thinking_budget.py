@@ -47,7 +47,9 @@ from vllm_torchtpu.layers.adapter.sample.scatter_ops import (
     seed_slot_rows,
 )
 from vllm_torchtpu.layers.adapter.sample.thinking_budget import (
+    COL_END_MATCH,
     COL_IN_THINK,
+    COL_NAT_END_MATCH,
     COL_THINK_COUNT,
     INT32_MAX,
     NO_FORCED_TOKEN,
@@ -167,7 +169,9 @@ def _make_sample_runner(
     spec_k: int | None = None,
     spec_method: str = "ngram",
 ) -> SimpleNamespace:
-    tracker = ThinkingBudgetTracker(reasoning_cfg, max_num_reqs=max_num_reqs)
+    tracker = ThinkingBudgetTracker(
+        reasoning_cfg, max_num_reqs=max_num_reqs, device=torch.device("cpu")
+    )
     min_tracker = min_tokens.MinTokensTracker()
     for rid, rstate in requests.items():
         tracker.add(rid, rstate.sampling_params, rstate.prompt_token_ids)
@@ -350,7 +354,9 @@ def _make_lifecycle_runner(
     runner._free_mamba_slots, runner._mamba_offset_seeded = [], set()
     runner._install_spec_token_room_guard = lambda: None
     runner._min_tokens = min_tokens.MinTokensTracker()
-    runner._thinking_budget = ThinkingBudgetTracker(cfg, max_num_reqs=max_num_reqs)
+    runner._thinking_budget = ThinkingBudgetTracker(
+        cfg, max_num_reqs=max_num_reqs, device=runner.device
+    )
     runner.input_batch = _make_input_batch(128, max_num_reqs=max_num_reqs)
     runner.late_interaction_runner = SimpleNamespace(
         on_requests_finished=lambda _ids: None,
@@ -443,7 +449,7 @@ class TestUpstreamParityAndBoundaries:
         holder = ThinkingBudgetStateHolder(cfg, 4, 0, torch.device("cpu"), False)
         v1_out: list[int] = []
         holder.sync_batch(BatchUpdate(1, (), [(0, params, list(prompt), v1_out)], ()))
-        tracker = ThinkingBudgetTracker(cfg, max_num_reqs=4)
+        tracker = ThinkingBudgetTracker(cfg, max_num_reqs=4, device=torch.device("cpu"))
         tracker.add("req0", params, prompt)
         req_state = _request_state("req0", prompt, params)
         requests = {"req0": req_state}
@@ -459,25 +465,28 @@ class TestUpstreamParityAndBoundaries:
             ref_logits = holder.apply_to_logits(ref_logits, False, None)
             v1_out.append(int(torch.argmax(ref_logits, dim=-1).item()))
 
-            state_table = tracker.prepare_step(torch.device("cpu"), ["req0"], requests)
+            state_table = tracker.prepare_step(["req0"], requests)
             tpu_tok = base_tok
             if state_table is not None:
                 assert tracker.markers is not None
-                slot_ids = tracker.build_chunk_slot_ids(
-                    torch.device("cpu"), ["req0"], 0, 1, padded_num_reqs=4
+                slot_ids = tracker.slots.build_chunk_slot_ids(
+                    ["req0"], 0, 1, padded_num_reqs=4
                 )
                 assert slot_ids is not None
                 row_logits = torch.zeros((4, vocab_size), dtype=torch.float32)
                 row_logits[0, base_tok] = 5.0
                 forced_ids = query_forced_tokens(
-                    state_table, slot_ids, tracker.markers.end_ids
+                    state_table,
+                    slot_ids,
+                    tracker.markers.natural_end_ids,
+                    tracker.markers.end_ids,
                 )
                 row_logits, _ = force_logits_rows(row_logits, forced_ids)
                 sel = torch.argmax(row_logits, dim=-1, keepdim=True)
                 state_table = advance_plain_states(
                     state_table, slot_ids, sel, *tracker.markers.kernel_args()
                 )
-                tracker.commit_state_table(state_table)
+                tracker.slots.commit_table(state_table)
                 tpu_tok = int(sel[0, 0].item())
             tpu_out.append(tpu_tok)
             req_state.output_token_ids.append(tpu_tok)
@@ -497,7 +506,9 @@ class TestUpstreamParityAndBoundaries:
             )
             is None
         )
-        tracker_disabled = ThinkingBudgetTracker(_reasoning_config([], []), 4)
+        tracker_disabled = ThinkingBudgetTracker(
+            _reasoning_config([], []), 4, torch.device("cpu")
+        )
         with patch.object(thinking_budget_tracker.logger, "warning_once") as warn:
             tracker_disabled.add("plain", SamplingParams(), [1])
             warn.assert_not_called()
@@ -535,7 +546,9 @@ class TestUpstreamParityAndBoundaries:
         assert query_forced_token(st_reopen, gemma) == GEMMA4_END[0]
 
         tracker = ThinkingBudgetTracker(
-            _reasoning_config(list(QWEN3_START), list(QWEN3_END)), max_num_reqs=4
+            _reasoning_config(list(QWEN3_START), list(QWEN3_END)),
+            max_num_reqs=4,
+            device=torch.device("cpu"),
         )
         tracker.add("huge", SamplingParams(thinking_token_budget=2**40), [1])
         assert tracker.requests["huge"] == INT32_MAX
@@ -600,6 +613,60 @@ class TestUpstreamParityAndBoundaries:
         )
         assert st_shadow[COL_IN_THINK] == 1 and st_shadow[COL_THINK_COUNT] == 1
 
+    def test_budget_hit_inside_multi_token_natural_end_completes_it(self) -> None:
+        """``reasoning_end_str`` may put a transition phrase before a multi-token
+        natural end marker. When the token that reaches the budget is the
+        marker's first token, forcing completes the natural marker (which closes
+        thinking) instead of interrupting it with ``end_ids[0]``."""
+        nat_ids, end_ids = [106, 107], [200, 201, 106, 107]
+        markers = ThinkingBudgetMarkers.from_reasoning_config(
+            _reasoning_config([90], end_ids, natural_end_ids=nat_ids)
+        )
+        assert markers is not None
+        kernel_args = markers.kernel_args()
+
+        # budget=2: think token 10, then 106 is the token that reaches it.
+        st = compute_sequence_state([1, 90, 10, 106], 2, markers)
+        assert st[COL_IN_THINK] == 1 and st[COL_THINK_COUNT] == 2
+        assert (st[COL_NAT_END_MATCH], st[COL_END_MATCH]) == (1, 0)
+        assert query_forced_token(st, markers) == 107
+        closed = advance_state(st, 107, markers)
+        assert closed[COL_IN_THINK] == 0
+        assert query_forced_token(closed, markers) == NO_FORCED_TOKEN
+        # Without a half-emitted natural marker, end_ids is forced from its start.
+        st_other = compute_sequence_state([1, 90, 10, 11], 2, markers)
+        assert query_forced_token(st_other, markers) == end_ids[0]
+
+        # Plain decode kernels: query, force the logits, sample and advance.
+        table = torch.tensor([UNTRACKED_STATE, st], dtype=torch.int32)
+        slots = torch.tensor([1, 0], dtype=torch.int32)
+        forced = query_forced_tokens(
+            table, slots, markers.natural_end_ids, markers.end_ids
+        )
+        assert forced.tolist() == [107, NO_FORCED_TOKEN]
+        logits = torch.zeros((2, 256))
+        logits[:, end_ids[0]] = 5.0
+        masked, _ = force_logits_rows(logits, forced)
+        sel = torch.argmax(masked, dim=-1, keepdim=True)
+        assert sel[:, 0].tolist() == [107, end_ids[0]]
+        table = advance_plain_states(table, slots, sel, *kernel_args)
+        assert tuple(table[1].tolist()) == closed
+
+        # Spec verify: drafts [10, 106, 107] reach the budget at 106 and the
+        # forced target for the third draft completes the natural marker.
+        open_st = compute_sequence_state([1, 90], 2, markers)
+        forced_tgt, forced_bonus = prepare_spec_verify_drafts(
+            torch.tensor([UNTRACKED_STATE, open_st], dtype=torch.int32),
+            torch.tensor([1], dtype=torch.int32),
+            torch.tensor([10, 106, 107], dtype=torch.int32),
+            torch.zeros(3, dtype=torch.int64),
+            torch.tensor([0, 1, 2], dtype=torch.int32),
+            3,
+            *kernel_args,
+        )
+        assert forced_tgt.tolist() == [NO_FORCED_TOKEN, NO_FORCED_TOKEN, 107]
+        assert forced_bonus.tolist() == [NO_FORCED_TOKEN]
+
 
 class TestKMPKernelsFuzz:
     """Randomized KMP parity across host sequences, plain decode, and spec verify."""
@@ -612,6 +679,7 @@ class TestKMPKernelsFuzz:
             ([10, 10, 11], [20, 20, 21], [20, 20, 21]),
             ([10, 20], [30, 31, 32], [29]),
             ([151667], [151668, 198], [151668]),
+            ([90], [200, 201, 106, 107], [106, 107]),
         ],
     )
     def test_randomized_kmp_fuzz_plain_and_spec_verify(
@@ -669,7 +737,9 @@ class TestKMPKernelsFuzz:
                     expected_out.append(chosen)
                     scalar_states[slot] = advance_state(st, chosen, markers)
 
-            forced_plain = query_forced_tokens(state_table, slot_t, markers.end_ids)
+            forced_plain = query_forced_tokens(
+                state_table, slot_t, markers.natural_end_ids, markers.end_ids
+            )
             masked_l, _ = force_logits_rows(plain_logits, forced_plain)
             sampled_from_logits = torch.argmax(masked_l, dim=-1, keepdim=True)
             next_tbl_logits = advance_plain_states(
@@ -738,10 +808,10 @@ class TestKMPKernelsFuzz:
             eff_t = invalidate_forced_drafts(draft_t, forced_tgt, did_f_t)
             raw_bonus_logits = torch.zeros((4, vocab_sz), dtype=torch.float32)
             raw_bonus_logits[:, 3] = 4.0
-            forced_bonus_4 = forced_bonus[:4]
-            fbonus_l, _ = force_logits_rows(raw_bonus_logits, forced_bonus_4)
+            # [6] slot-width bonus IDs for 4 bonus rows: the kernels slice.
+            fbonus_l, _ = force_logits_rows(raw_bonus_logits, forced_bonus)
             fbonus_t, _ = force_token_ids(
-                torch.full((4,), 3, dtype=torch.int64), forced_bonus_4
+                torch.full((4,), 3, dtype=torch.int64), forced_bonus
             )
             assert eff_l.tolist() == exp_eff.tolist() == eff_t.tolist()
             assert torch.argmax(flogits, dim=-1).tolist() == ftokens.tolist()
@@ -771,7 +841,9 @@ class TestKMPKernelsFuzz:
 
     def test_logits_immutability_neg_inf_guard_and_amax_sentinel(self) -> None:
         cfg = _reasoning_config(list(GEMMA4_START), list(GEMMA4_END))
-        tracker = ThinkingBudgetTracker(cfg, max_num_reqs=512)
+        tracker = ThinkingBudgetTracker(
+            cfg, max_num_reqs=512, device=torch.device("cpu")
+        )
         assert tracker.markers is not None
         reqs: dict[str, CachedRequestState] = {}
         batch_ids = [f"r_{i}" for i in range(300)]
@@ -779,10 +851,8 @@ class TestKMPKernelsFuzz:
             sp = SamplingParams(thinking_token_budget=None if i % 3 == 0 else 0)
             reqs[rid] = _request_state(rid, [1, *GEMMA4_START], sp)
             tracker.add(rid, sp, [1, *GEMMA4_START])
-        table = tracker.prepare_step(torch.device("cpu"), batch_ids, reqs)
-        slots = tracker.build_chunk_slot_ids(
-            torch.device("cpu"), batch_ids, 0, 300, 512
-        )
+        table = tracker.prepare_step(batch_ids, reqs)
+        slots = tracker.slots.build_chunk_slot_ids(batch_ids, 0, 300, 512)
         assert table is not None and slots is not None and slots[300].item() == 0
         seg = torch.full((1024,), 300, dtype=torch.int64)
         seg[0] = 1
@@ -838,7 +908,10 @@ class TestLifecyclePreemptionAndChunkedPrefill:
     def test_reusable_request_slot_table_for_stateful_processors(self) -> None:
         """Verify ``RequestSlotTable`` works independently of KMP state."""
         pool: RequestSlotTable[tuple[int, int]] = RequestSlotTable(
-            max_num_reqs=2, num_cols=2, sentinel_row=(-99, 0)
+            max_num_reqs=2,
+            num_cols=2,
+            device=torch.device("cpu"),
+            sentinel_row=(-99, 0),
         )
         assert pool.max_num_reqs == 2 and pool.table is None
         tracked = {"a": (10, 1), "b": (20, 2), "c": (30, 3)}
@@ -852,7 +925,7 @@ class TestLifecyclePreemptionAndChunkedPrefill:
             cold_calls.append(rid)
             return tracked[rid]
 
-        tbl = pool.sync_step(torch.device("cpu"), ["a", "b"], tracked, cold_row)
+        tbl = pool.sync_step(["a", "b"], tracked, cold_row)
         assert tbl is not None and tbl.shape == (3, 2) and cold_calls == ["b"]
         assert tuple(tbl[0].tolist()) == (-99, 0)
         sa, sb = pool.slot_for("a"), pool.slot_for("b")
@@ -860,20 +933,45 @@ class TestLifecyclePreemptionAndChunkedPrefill:
         assert tuple(tbl[sa].tolist()) == (10, 1)
         assert tuple(tbl[sb].tolist()) == (20, 2)
 
-        sl1 = pool.build_chunk_slot_ids(torch.device("cpu"), ["a", "b"], 0, 2)
-        sl2 = pool.build_chunk_slot_ids(torch.device("cpu"), ["a", "b"], 0, 2)
+        sl1 = pool.build_chunk_slot_ids(["a", "b"], 0, 2)
+        sl2 = pool.build_chunk_slot_ids(["a", "b"], 0, 2)
         assert sl1 is not None and sl2 is sl1 and sl1.tolist() == [sa, sb]
 
         # Wave swap frees 'a' and cold-reseeds 'c', then cold-reseeds 'a' on return.
-        tbl = pool.sync_step(torch.device("cpu"), ["b", "c"], tracked, cold_row)
+        tbl = pool.sync_step(["b", "c"], tracked, cold_row)
         assert tbl is not None and "a" not in pool.allocated_req_ids()
         assert cold_calls == ["b", "c"]
-        tbl = pool.sync_step(torch.device("cpu"), ["a", "c"], tracked, cold_row)
+        tbl = pool.sync_step(["a", "c"], tracked, cold_row)
         assert tbl is not None and cold_calls == ["b", "c", "a"]
+
+    def test_slot_id_uploads_cached_per_chunk_across_steps(self) -> None:
+        """A step with two chunks keeps one cached slot-ID upload per chunk."""
+        pool: RequestSlotTable[tuple[int]] = RequestSlotTable(
+            max_num_reqs=4, num_cols=1, device=torch.device("cpu")
+        )
+        tracked = {rid: (7,) for rid in ("a", "b", "c", "d")}
+        batch = ["a", "b", "c", "d"]
+        assert pool.sync_step(batch, tracked, tracked.__getitem__) is not None
+
+        def chunk_uploads(req_ids: list[str]) -> list[torch.Tensor | None]:
+            return [
+                pool.build_chunk_slot_ids(req_ids, 0, 2, 2),
+                pool.build_chunk_slot_ids(req_ids, 2, 4, 2),
+            ]
+
+        step1 = chunk_uploads(batch)
+        step2 = chunk_uploads(batch)
+        assert step1[0] is not None and step1[1] is not None
+        assert step2[0] is step1[0] and step2[1] is step1[1]
+        # Swapping two rows of the second chunk re-uploads only that chunk.
+        step3 = chunk_uploads(["a", "b", "d", "c"])
+        assert step3[0] is step1[0] and step3[1] is not step1[1]
+        assert step3[1] is not None
+        assert step3[1].tolist() == step1[1].tolist()[::-1]
 
     def test_update_states_lifecycle_slot_reuse_and_batch_reorder(self) -> None:
         cfg = _reasoning_config(list(QWEN3_START), list(QWEN3_END))
-        tracker = ThinkingBudgetTracker(cfg, max_num_reqs=2)
+        tracker = ThinkingBudgetTracker(cfg, max_num_reqs=2, device=torch.device("cpu"))
         tracker.add("plain", SamplingParams(), [1, QWEN3_START[0]])
         tracker.add("pool", None, [1])
         assert tracker.enabled and not tracker and tracker.slots.table is None
@@ -886,30 +984,22 @@ class TestLifecyclePreemptionAndChunkedPrefill:
         for rid in reqs:
             tracker.add(rid, sp2, [1, QWEN3_START[0]])
         assert (
-            tracker.prepare_step(
-                torch.device("cpu"), ["r0", "r1"], {"r0": reqs["r0"], "r1": reqs["r1"]}
-            )
+            tracker.prepare_step(["r0", "r1"], {"r0": reqs["r0"], "r1": reqs["r1"]})
             is not None
         )
         # Steady-state build_chunk_slot_ids reuses the cached tensor without H2D copy.
-        s1 = tracker.build_chunk_slot_ids(torch.device("cpu"), ["r0", "r1"], 0, 2, 4)
-        s2 = tracker.build_chunk_slot_ids(torch.device("cpu"), ["r0", "r1"], 0, 2, 4)
-        s_pad8 = tracker.build_chunk_slot_ids(
-            torch.device("cpu"), ["r0", "r1"], 0, 2, 8
-        )
-        s_reord = tracker.build_chunk_slot_ids(
-            torch.device("cpu"), ["r1", "r0"], 0, 2, 4
-        )
+        s1 = tracker.slots.build_chunk_slot_ids(["r0", "r1"], 0, 2, 4)
+        s2 = tracker.slots.build_chunk_slot_ids(["r0", "r1"], 0, 2, 4)
+        s_pad8 = tracker.slots.build_chunk_slot_ids(["r0", "r1"], 0, 2, 8)
+        s_reord = tracker.slots.build_chunk_slot_ids(["r1", "r0"], 0, 2, 4)
         assert s1 is not None and s2 is s1
         assert s_pad8 is not None and s_pad8 is not s1 and s_pad8.shape == (8,)
         assert s_reord is not None and s_reord.tolist()[:2] == s1.tolist()[:2][::-1]
 
         with pytest.raises(AssertionError, match="RequestSlotTable pool exhausted"):
-            tracker.prepare_step(torch.device("cpu"), ["r0", "r1", "r2"], reqs)
+            tracker.prepare_step(["r0", "r1", "r2"], reqs)
         assert (
-            tracker.prepare_step(
-                torch.device("cpu"), ["r1", "r2"], {"r1": reqs["r1"], "r2": reqs["r2"]}
-            )
+            tracker.prepare_step(["r1", "r2"], {"r1": reqs["r1"], "r2": reqs["r2"]})
             is not None
         )
         allocated = tracker.slots.allocated_req_ids()
@@ -940,7 +1030,7 @@ class TestLifecyclePreemptionAndChunkedPrefill:
             )
         assert batch.thinking_budget_state_holder is None
 
-        tb_swap = ThinkingBudgetTracker(cfg, max_num_reqs=4)
+        tb_swap = ThinkingBudgetTracker(cfg, max_num_reqs=4, device=torch.device("cpu"))
         pa = SamplingParams(thinking_token_budget=1)
         ra = _request_state("a", [1, QWEN3_START[0], 10], pa)
         rb = _request_state("b", [1, QWEN3_START[0], 10], SamplingParams())
@@ -950,12 +1040,8 @@ class TestLifecyclePreemptionAndChunkedPrefill:
         batch.swap_states(0, 1)
         tb_swap.add("a", pa, ra.prompt_token_ids)
         tb_swap.add("b", rb.sampling_params, rb.prompt_token_ids)
-        st = tb_swap.prepare_step(
-            torch.device("cpu"), batch.req_ids[:2], {"a": ra, "b": rb}
-        )
-        slots = tb_swap.build_chunk_slot_ids(
-            torch.device("cpu"), batch.req_ids, 0, 2, 4
-        )
+        st = tb_swap.prepare_step(batch.req_ids[:2], {"a": ra, "b": rb})
+        slots = tb_swap.slots.build_chunk_slot_ids(batch.req_ids, 0, 2, 4)
         assert st is not None and slots is not None and tb_swap.markers is not None
         out, _ = override_and_advance_plain(
             st,
@@ -1031,16 +1117,14 @@ class TestLifecyclePreemptionAndChunkedPrefill:
             runner._update_states(so)
 
         def decode_wave(wave_ids: list[str], raw_toks: list[int]) -> list[int]:
-            tbl = tracker.prepare_step(torch.device("cpu"), wave_ids, runner.requests)
-            sl = tracker.build_chunk_slot_ids(
-                torch.device("cpu"), wave_ids, 0, len(wave_ids), 2
-            )
+            tbl = tracker.prepare_step(wave_ids, runner.requests)
+            sl = tracker.slots.build_chunk_slot_ids(wave_ids, 0, len(wave_ids), 2)
             assert tbl is not None and sl is not None and tracker.markers is not None
             sel = torch.tensor([[t] for t in raw_toks], dtype=torch.int64)
             out, tbl = override_and_advance_plain(
                 tbl, sl, sel, *tracker.markers.kernel_args()
             )
-            tracker.commit_state_table(tbl)
+            tracker.slots.commit_table(tbl)
             toks = [int(out[i, 0].item()) for i in range(len(wave_ids))]
             for rid, tok in zip(wave_ids, toks):
                 runner.requests[rid].output_token_ids.append(tok)
@@ -1107,8 +1191,8 @@ class TestLifecyclePreemptionAndChunkedPrefill:
         ]
         runner._update_states(so_new)
 
-        table = tracker.prepare_step(torch.device("cpu"), ["p"], runner.requests)
-        slots = tracker.build_chunk_slot_ids(torch.device("cpu"), ["p"], 0, 1, 4)
+        table = tracker.prepare_step(["p"], runner.requests)
+        slots = tracker.slots.build_chunk_slot_ids(["p"], 0, 1, 4)
         assert table is not None and slots is not None and tracker.markers is not None
         for tok in (20, 21, 22):
             _, table = override_and_advance_plain(
@@ -1117,7 +1201,7 @@ class TestLifecyclePreemptionAndChunkedPrefill:
                 torch.tensor([[tok], [0], [0], [0]], dtype=torch.int64),
                 *tracker.markers.kernel_args(),
             )
-            tracker.commit_state_table(table)
+            tracker.slots.commit_table(table)
         runner.requests["p"].output_token_ids = [20, 0, 0, 0]
 
         so_preempt = SchedulerOutput.make_empty()
@@ -1142,8 +1226,8 @@ class TestLifecyclePreemptionAndChunkedPrefill:
         runner._update_states(so_resume)
         assert runner.requests["p"].output_token_ids == settled_outputs
 
-        table = tracker.prepare_step(torch.device("cpu"), ["p"], runner.requests)
-        slots = tracker.build_chunk_slot_ids(torch.device("cpu"), ["p"], 0, 1, 4)
+        table = tracker.prepare_step(["p"], runner.requests)
+        slots = tracker.slots.build_chunk_slot_ids(["p"], 0, 1, 4)
         assert table is not None and slots is not None
         emitted: list[int] = []
         for tok in (30, 31, 32, 33, 34):
@@ -1153,7 +1237,7 @@ class TestLifecyclePreemptionAndChunkedPrefill:
                 torch.tensor([[tok], [0], [0], [0]], dtype=torch.int64),
                 *tracker.markers.kernel_args(),
             )
-            tracker.commit_state_table(table)
+            tracker.slots.commit_table(table)
             emitted.append(int(out[0, 0].item()))
         expected_prefix = [30, 31, 32][: 3 - len(settled_outputs)] + list(GEMMA4_END)
         assert emitted[: len(expected_prefix)] == expected_prefix
@@ -1223,9 +1307,7 @@ class TestLifecyclePreemptionAndChunkedPrefill:
             vocab_size=128,
             async_scheduling=True,
         )
-        runner1._thinking_budget.prepare_step(
-            torch.device("cpu"), ["other"], {"other": req_other}
-        )
+        runner1._thinking_budget.prepare_step(["other"], {"other": req_other})
         runner1._thinking_budget.slots.release(["r0"])
         events1: list[str] = []
         runner1._greedy_sample = lambda x: (
@@ -1473,13 +1555,11 @@ class TestSampleTokens:
         cfg = _reasoning_config(list(GEMMA4_START), list(GEMMA4_END))
         sp = SamplingParams(temperature=0.0, thinking_token_budget=0)
         req = _request_state("r0", [1, *GEMMA4_START], sp)
-        tracker = ThinkingBudgetTracker(cfg, max_num_reqs=4)
+        tracker = ThinkingBudgetTracker(cfg, max_num_reqs=4, device=torch.device("cpu"))
         tracker.add("r0", sp, req.prompt_token_ids)
-        tb_step = tracker.step_state(
-            torch.device("cpu"), ["r0"], {"r0": req}, frozenset()
-        )
+        tb_step = tracker.step_state(["r0"], {"r0": req}, frozenset())
         assert tb_step is not None
-        tb_proc = tb_step.plain_chunk(torch.device("cpu"), ["r0"], 0, 1)
+        tb_proc = tb_step.plain_chunk(["r0"], 0, 1)
         assert tb_proc is not None
 
         raw = torch.zeros((4, 128), dtype=torch.float32)
@@ -1533,7 +1613,7 @@ class TestSampleTokens:
         assert int(tb_step.state_table[slot_r0, COL_THINK_COUNT].item()) == 1
 
         stateless = plain_chunk_sampler.StatelessPlainChunkProcessor(grammar_block_99)
-        with pytest.raises(AssertionError, match="top_tokens"):
+        with pytest.raises(NotImplementedError, match="top_tokens"):
             plain_chunk_sampler.sample_plain_chunk(
                 torch.tensor([[12]], dtype=torch.int64),
                 cur_start_idx=0,
@@ -1614,7 +1694,7 @@ class TestSampleTokens:
                 [50, 51, 52, GEMMA4_END[0]],
                 [69],
             ]
-            st_tbl = runner._thinking_budget.slots.ensure_table(torch.device("cpu"))
+            st_tbl = runner._thinking_budget.slots.ensure_table()
             slot_r2 = runner._thinking_budget.slots.slot_for("r2")
             assert slot_r2 is not None
             assert int(st_tbl[slot_r2, COL_THINK_COUNT].item()) == 1
@@ -1802,7 +1882,9 @@ class TestPrecompileAndTPU:
                 runner.structured_decoding_manager = SimpleNamespace(
                     target_grammar_bitmask_cpu=torch.zeros((64, 1), dtype=torch.int32)
                 )
-                runner._thinking_budget = ThinkingBudgetTracker(cfg, max_num_reqs=64)
+                runner._thinking_budget = ThinkingBudgetTracker(
+                    cfg, max_num_reqs=64, device=runner.device
+                )
 
                 runner._precompile_thinking_budget()
                 precompiled, calls = calls, set()
@@ -1818,12 +1900,12 @@ class TestPrecompileAndTPU:
                 sp = SamplingParams(thinking_token_budget=2)
                 tb.add("r0", sp, [1, *GEMMA4_START])
                 req = _request_state("r0", [1, *GEMMA4_START], sp)
-                st_table = tb.prepare_step(torch.device("cpu"), ["r0"], {"r0": req})
+                st_table = tb.prepare_step(["r0"], {"r0": req})
                 assert st_table is not None
 
                 step = ThinkingBudgetStepState(tb, st_table, tb.markers, frozenset())
                 for num_reqs in runner.num_reqs_paddings:
-                    pchunk = step.plain_chunk(torch.device("cpu"), ["r0"], 0, 1)
+                    pchunk = step.plain_chunk(["r0"], 0, 1)
                     assert pchunk is not None
                     pchunk.mask_logits(
                         torch.zeros((num_reqs, 128), dtype=torch.bfloat16)
@@ -1840,7 +1922,7 @@ class TestPrecompileAndTPU:
                             num_tokens, num_reqs
                         ):
                             continue
-                        chunk = step.spec_chunk(torch.device("cpu"), ["r0"], 0, 1)
+                        chunk = step.spec_chunk(["r0"], 0, 1)
                         assert chunk is not None
                         seg_ids = torch.full((num_tokens,), 1, dtype=torch.int64)
                         grp_ids = torch.zeros(num_tokens, dtype=torch.int32)
@@ -1879,8 +1961,8 @@ class TestPrecompileAndTPU:
         assert markers is not None
         kernel_args = markers.kernel_args()
 
-        cpu_tb = ThinkingBudgetTracker(cfg, max_num_reqs=4)
-        tpu_tb = ThinkingBudgetTracker(cfg, max_num_reqs=4)
+        cpu_tb = ThinkingBudgetTracker(cfg, max_num_reqs=4, device=torch.device("cpu"))
+        tpu_tb = ThinkingBudgetTracker(cfg, max_num_reqs=4, device=tpu)
         reqs: dict[str, CachedRequestState] = {}
         batch_ids = ["a", "b", "c", "d"]
         for rid, b in (("a", 0), ("b", 1), ("c", 2), ("d", None)):
@@ -1890,12 +1972,10 @@ class TestPrecompileAndTPU:
             tpu_tb.add(rid, sp, [1, *GEMMA4_START])
 
         with torch.compiler.set_stance("force_eager"):
-            cpu_tbl = cpu_tb.prepare_step(torch.device("cpu"), batch_ids, reqs)
-            cpu_sl = cpu_tb.build_chunk_slot_ids(
-                torch.device("cpu"), batch_ids, 0, 4, 4
-            )
-        tpu_tbl = tpu_tb.prepare_step(tpu, batch_ids, reqs)
-        tpu_sl = tpu_tb.build_chunk_slot_ids(tpu, batch_ids, 0, 4, 4)
+            cpu_tbl = cpu_tb.prepare_step(batch_ids, reqs)
+            cpu_sl = cpu_tb.slots.build_chunk_slot_ids(batch_ids, 0, 4, 4)
+        tpu_tbl = tpu_tb.prepare_step(batch_ids, reqs)
+        tpu_sl = tpu_tb.slots.build_chunk_slot_ids(batch_ids, 0, 4, 4)
         assert cpu_tbl is not None and tpu_tbl is not None
         assert cpu_sl is not None and tpu_sl is not None
         synchronize_tensors(tpu_tbl)
@@ -1920,13 +2000,12 @@ class TestPrecompileAndTPU:
             )
             fl_cpu, df_l_cpu = force_logits_rows(logits_cpu, ftgt_cpu)
             ed_cpu = invalidate_forced_drafts(drafts_cpu, ftgt_cpu, df_l_cpu)
-            fbon_2_cpu = fbon_cpu[:2]
-            fbl_cpu, _ = force_logits_rows(bonus_logits_cpu, fbon_2_cpu)
+            fbl_cpu, _ = force_logits_rows(bonus_logits_cpu, fbon_cpu)
             ft_cpu, df_t_cpu = force_token_ids(
                 torch.arange(16, dtype=torch.int64), ftgt_cpu
             )
             edt_cpu = invalidate_forced_drafts(drafts_cpu, ftgt_cpu, df_t_cpu)
-            fbt_cpu, _ = force_token_ids(torch.arange(2, dtype=torch.int64), fbon_2_cpu)
+            fbt_cpu, _ = force_token_ids(torch.arange(2, dtype=torch.int64), fbon_cpu)
 
         ftgt_tpu, fbon_tpu = prepare_spec_verify_drafts(
             tpu_tbl,
@@ -1939,14 +2018,13 @@ class TestPrecompileAndTPU:
         )
         fl_tpu, df_l_tpu = force_logits_rows(logits_cpu.to(tpu), ftgt_tpu)
         ed_tpu = invalidate_forced_drafts(drafts_cpu.to(tpu), ftgt_tpu, df_l_tpu)
-        fbon_2_tpu = fbon_tpu[:2]
-        fbl_tpu, _ = force_logits_rows(bonus_logits_cpu.to(tpu), fbon_2_tpu)
+        fbl_tpu, _ = force_logits_rows(bonus_logits_cpu.to(tpu), fbon_tpu)
         ft_tpu, df_t_tpu = force_token_ids(
             torch.arange(16, dtype=torch.int64).to(tpu), ftgt_tpu
         )
         edt_tpu = invalidate_forced_drafts(drafts_cpu.to(tpu), ftgt_tpu, df_t_tpu)
         fbt_tpu, _ = force_token_ids(
-            torch.arange(2, dtype=torch.int64).to(tpu), fbon_2_tpu
+            torch.arange(2, dtype=torch.int64).to(tpu), fbon_tpu
         )
         synchronize_tensors([fl_tpu, ed_tpu, fbl_tpu, ft_tpu, edt_tpu, fbt_tpu])
         assert torch.equal(fl_tpu.cpu(), fl_cpu) and torch.equal(ed_tpu.cpu(), ed_cpu)
@@ -1962,7 +2040,9 @@ class TestPrecompileAndTPU:
         sel_cpu = torch.tensor([[40], [41], [42], [43]], dtype=torch.int64)
         with torch.compiler.set_stance("force_eager"):
             cpu_tbl = advance_spec_states(cpu_tbl, cpu_sl, next_cpu, 3, *kernel_args)
-            fplain_cpu = query_forced_tokens(cpu_tbl, cpu_sl, markers.end_ids)
+            fplain_cpu = query_forced_tokens(
+                cpu_tbl, cpu_sl, markers.natural_end_ids, markers.end_ids
+            )
             mpl_cpu, _ = force_logits_rows(plain_logits_cpu, fplain_cpu)
             cpu_tbl_adv = advance_plain_states(cpu_tbl, cpu_sl, sel_cpu, *kernel_args)
             out_p_cpu, cpu_tbl = override_and_advance_plain(
@@ -1972,7 +2052,9 @@ class TestPrecompileAndTPU:
         tpu_tbl = advance_spec_states(
             tpu_tbl, tpu_sl, next_cpu.to(tpu), 3, *kernel_args
         )
-        fplain_tpu = query_forced_tokens(tpu_tbl, tpu_sl, markers.end_ids)
+        fplain_tpu = query_forced_tokens(
+            tpu_tbl, tpu_sl, markers.natural_end_ids, markers.end_ids
+        )
         mpl_tpu, _ = force_logits_rows(plain_logits_cpu.to(tpu), fplain_tpu)
         tpu_tbl_adv = advance_plain_states(
             tpu_tbl, tpu_sl, sel_cpu.to(tpu), *kernel_args

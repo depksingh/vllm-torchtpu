@@ -79,8 +79,12 @@ class StatelessPlainChunkProcessor:
         return None
 
     def override_top_tokens(self, selected_token_ids: torch.Tensor) -> torch.Tensor:
-        raise AssertionError(
-            "StatelessPlainChunkProcessor cannot mask pre-selected top_tokens"
+        raise NotImplementedError(
+            "StatelessPlainChunkProcessor cannot mask pre-selected top_tokens "
+            "(TPU_GREEDY_TOP_TOKENS). Keep such steps on full logits, as "
+            "TPUModelRunner._greedy_top_tokens_this_step does for min_tokens, "
+            "or implement a PlainChunkProcessor whose override_top_tokens "
+            "rewrites the tokens."
         )
 
 

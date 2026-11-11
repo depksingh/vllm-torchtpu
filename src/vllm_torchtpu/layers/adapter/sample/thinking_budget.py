@@ -218,19 +218,29 @@ def _query_forced_token_cols[TVal: (int, torch.Tensor)](
     budget: TVal,
     in_think: TVal,
     think_count: TVal,
+    nat_end_match: TVal,
     end_match: TVal,
     forcing_end: TVal,
+    nat_ids: tuple[int, ...],
     end_ids: tuple[int, ...],
 ) -> TVal:
     should_force = _and(
         _and(budget >= 0, in_think != 0),
         _or(forcing_end != 0, think_count >= budget),
     )
-    return _where(
-        should_force,
-        _gather_end_token(end_ids, end_match),
-        _const(budget, NO_FORCED_TOKEN),
-    )
+    forced_tok = _gather_end_token(end_ids, end_match)
+    # Only a multi-token natural marker distinct from end_ids can be partly
+    # emitted while no end_ids prefix is matched (nat_end_match tracks
+    # end_match when they are equal, and wraps to 0 for a single token).
+    if len(nat_ids) > 1 and nat_ids != end_ids:
+        # The budget ran out inside a half-emitted natural end marker:
+        # complete it rather than interrupt it with end_ids[0] (end_ids may
+        # put a transition phrase before the natural marker).
+        finish_nat = _and(_and(forcing_end == 0, end_match == 0), nat_end_match > 0)
+        forced_tok = _where(
+            finish_nat, _gather_end_token(nat_ids, nat_end_match), forced_tok
+        )
+    return _where(should_force, forced_tok, _const(budget, NO_FORCED_TOKEN))
 
 
 def _advance_state_cols[TVal: (int, torch.Tensor)](
@@ -352,8 +362,10 @@ def query_forced_token(state: StateTuple, markers: ThinkingBudgetMarkers) -> int
         state[COL_BUDGET],
         state[COL_IN_THINK],
         state[COL_THINK_COUNT],
+        state[COL_NAT_END_MATCH],
         state[COL_END_MATCH],
         state[COL_FORCING_END],
+        markers.natural_end_ids,
         markers.end_ids,
     )
 
@@ -430,14 +442,16 @@ def compute_sequence_state(
 
 
 def _query_forced_token_tensor(
-    st: torch.Tensor, end_ids: tuple[int, ...]
+    st: torch.Tensor, nat_ids: tuple[int, ...], end_ids: tuple[int, ...]
 ) -> torch.Tensor:
     return _query_forced_token_cols(
         st[:, COL_BUDGET],
         st[:, COL_IN_THINK],
         st[:, COL_THINK_COUNT],
+        st[:, COL_NAT_END_MATCH],
         st[:, COL_END_MATCH],
         st[:, COL_FORCING_END],
+        nat_ids,
         end_ids,
     )
 
@@ -493,12 +507,15 @@ def _select_slot_states(
 def query_forced_tokens(
     state_table: torch.Tensor,
     slot_ids: torch.Tensor,
+    nat_ids: tuple[int, ...],
     end_ids: tuple[int, ...],
 ) -> torch.Tensor:
-    """Query ``[slot_ids.shape[0]]`` forced ``end_ids`` tokens (``-1`` if unforced)."""
+    """Query ``[slot_ids.shape[0]]`` forced end tokens (``-1`` if unforced)."""
     active_slot, st = _select_slot_states(state_table, slot_ids)
     no_tok = torch.full_like(slot_ids, NO_FORCED_TOKEN)
-    return torch.where(active_slot, _query_forced_token_tensor(st, end_ids), no_tok)
+    return torch.where(
+        active_slot, _query_forced_token_tensor(st, nat_ids, end_ids), no_tok
+    )
 
 
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
@@ -509,10 +526,13 @@ def force_logits_rows(
     """Mask ``logits`` to one-hot ``0.0`` at ``forced_ids`` when permitted.
 
     Shared across plain decode, speculative bonus logits, and speculative target
-    logits so overlapping ``[rows, vocab_size]`` buckets compile once. If
-    ``logits[row, forced_id]`` is already ``-inf`` (masked out by grammar or
-    ``min_tokens``), the row is left unchanged and ``did_force[row]`` is False.
+    logits. ``forced_ids`` may be longer than ``logits`` (plain and bonus rows
+    pass the ``[max_num_reqs]`` slot-width query); only its first
+    ``logits.shape[0]`` entries are used. If ``logits[row, forced_id]`` is
+    already ``-inf`` (masked out by grammar or ``min_tokens``), the row is left
+    unchanged and ``did_force[row]`` is False.
     """
+    forced_ids = forced_ids[: logits.shape[0]]
     safe_ids = forced_ids.clamp(min=0, max=logits.shape[-1] - 1).to(torch.int64)
     orig_forced = logits.gather(-1, safe_ids.unsqueeze(-1))
     can_force = (forced_ids >= 0).unsqueeze(-1) & ~torch.isneginf(orig_forced)
@@ -526,7 +546,11 @@ def force_token_ids(
     token_ids: torch.Tensor,
     forced_ids: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Override 1D greedy ``token_ids`` where ``forced_ids >= 0``."""
+    """Override 1D greedy ``token_ids`` where ``forced_ids >= 0``.
+
+    Only the first ``token_ids.shape[0]`` entries of ``forced_ids`` are used.
+    """
+    forced_ids = forced_ids[: token_ids.shape[0]]
     did_force = forced_ids >= 0
     forced_out = torch.where(did_force, forced_ids.to(token_ids.dtype), token_ids)
     return forced_out, did_force
@@ -590,7 +614,7 @@ def override_and_advance_plain(
     """Override ``TPU_GREEDY_TOP_TOKENS`` IDs and advance ``state_table``."""
     chunk_slots = slot_ids[: selected_token_ids.shape[0]]
     active_slot, st = _select_slot_states(state_table, chunk_slots)
-    forced_id = _query_forced_token_tensor(st, end_ids)
+    forced_id = _query_forced_token_tensor(st, nat_ids, end_ids)
     out_tokens = torch.where(
         (active_slot & (forced_id >= 0)).unsqueeze(-1),
         forced_id.to(selected_token_ids.dtype).unsqueeze(-1),
@@ -664,7 +688,9 @@ def prepare_spec_verify_drafts(
         forced_cols: list[torch.Tensor] = []
         for step_idx in range(max_draft_tokens):
             step_forced_req = torch.where(
-                active_slot, _query_forced_token_tensor(st, end_ids), no_req_tok
+                active_slot,
+                _query_forced_token_tensor(st, nat_ids, end_ids),
+                no_req_tok,
             )
             forced_cols.append(step_forced_req)
             d_tok = draft_grid[:, step_idx]
@@ -688,7 +714,7 @@ def prepare_spec_verify_drafts(
         forced_target_ids = no_tok
 
     forced_bonus_full = torch.where(
-        active_slot, _query_forced_token_tensor(st, end_ids), no_req_tok
+        active_slot, _query_forced_token_tensor(st, nat_ids, end_ids), no_req_tok
     )
     return forced_target_ids, forced_bonus_full
 

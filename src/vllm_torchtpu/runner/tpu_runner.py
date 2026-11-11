@@ -25,7 +25,7 @@ import dataclasses
 import math
 import os
 import time
-from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -1085,10 +1085,14 @@ class TPUModelRunner(GPUModelRunner):
         self.execute_model_state: ExecuteModelState | None = None
         self._pre_async_results: AsyncPreResults | None = None
         self._min_tokens = min_tokens_mask.MinTokensTracker()
+        # ThinkingBudgetTracker enforces thinking_token_budget; upstream's holder
+        # would make InputBatch.refresh_metadata run holder.sync_batch (prompt
+        # scans, unused per-row state) on every batch update.
         self.input_batch.thinking_budget_state_holder = None
         self._thinking_budget = thinking_budget_tracker.ThinkingBudgetTracker(
             self.vllm_config.reasoning_config,
             max_num_reqs=self.max_num_reqs,
+            device=self.device,
         )
         # 1 on TP rank 0, else 0; built lazily on first use by
         # _sync_replicated_drafts_across_tp (needs the TP group initialized).
@@ -5020,21 +5024,26 @@ class TPUModelRunner(GPUModelRunner):
         all_greedy: bool,
         sampling_generator: torch.Generator | None,
         grammar_output: "GrammarOutput | None",
-        scheduled_spec_decode_tokens: Mapping[str, Sequence[int]] | None,
+        scheduler_output: "SchedulerOutput",
+        is_spec_step: bool,
         min_toks: min_tokens_mask.MinTokensState,
         tb_step: thinking_budget_tracker.ThinkingBudgetStepState | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Mask and sample a plain chunk ``[cur_start_idx, cur_end_idx)``."""
+        """Mask and sample a plain chunk ``[cur_start_idx, cur_end_idx)``.
+
+        ``is_spec_step`` marks a draft-less chunk inside a speculative step,
+        whose grammar rows follow ``scheduled_spec_decode_tokens``.
+        """
         grammar_mask_fn: plain_chunk_sampler.LogitsProcessorFn | None = None
         if grammar_output is not None:
-            if scheduled_spec_decode_tokens is not None:
+            if is_spec_step:
 
                 def _mask_spec_grammar(lg: torch.Tensor) -> torch.Tensor:
                     _, masked = self.structured_decoding_manager.mask_spec_logits(
                         None,
                         lg,
                         grammar_output,
-                        scheduled_spec_decode_tokens,
+                        scheduler_output.scheduled_spec_decode_tokens,
                         None,
                         cur_start_idx,
                         cur_end_idx,
@@ -5061,10 +5070,7 @@ class TPUModelRunner(GPUModelRunner):
             )
         if tb_step is not None:
             tb_proc = tb_step.plain_chunk(
-                logits.device,
-                self.input_batch.req_ids,
-                cur_start_idx,
-                cur_end_idx,
+                self.input_batch.req_ids, cur_start_idx, cur_end_idx
             )
             if tb_proc is not None:
                 processors.append(tb_proc)
@@ -5395,19 +5401,15 @@ class TPUModelRunner(GPUModelRunner):
 
         tb_step = None
         if not self.is_pooling_model and state.logits_list and self._thinking_budget:
-            tb_device = state.logits_list[0].device
             if self._pre_async_results is not None:
                 in_flight = set(self._pre_async_results.req_ids)
                 if self._thinking_budget.needs_output_reseed(
-                    (r for r in req_ids if r in in_flight), tb_device
+                    r for r in req_ids if r in in_flight
                 ):
                     self._modify_prev_results()
                     self._pre_async_results = None
             tb_step = self._thinking_budget.step_state(
-                tb_device,
-                req_ids,
-                self.requests,
-                discard_sampled_tokens_req_ids,
+                req_ids, self.requests, discard_sampled_tokens_req_ids
             )
         if self.is_pooling_model:
             self._update_num_xla_graphs("pooling_step")
@@ -5425,10 +5427,7 @@ class TPUModelRunner(GPUModelRunner):
                 if md is not None:
                     tb_chunk = (
                         tb_step.spec_chunk(
-                            logits.device,
-                            self.input_batch.req_ids,
-                            cur_start_idx,
-                            cur_end_idx,
+                            self.input_batch.req_ids, cur_start_idx, cur_end_idx
                         )
                         if tb_step is not None
                         else None
@@ -5480,11 +5479,8 @@ class TPUModelRunner(GPUModelRunner):
                         all_greedy=all_greedy,
                         sampling_generator=sampling_generator,
                         grammar_output=grammar_output,
-                        scheduled_spec_decode_tokens=(
-                            scheduler_output.scheduled_spec_decode_tokens
-                            if grammar_output is not None
-                            else None
-                        ),
+                        scheduler_output=scheduler_output,
+                        is_spec_step=True,
                         min_toks=min_toks,
                         tb_step=tb_step,
                     )
@@ -5532,7 +5528,8 @@ class TPUModelRunner(GPUModelRunner):
                     all_greedy=all_greedy,
                     sampling_generator=sampling_generator,
                     grammar_output=grammar_output,
-                    scheduled_spec_decode_tokens=None,
+                    scheduler_output=scheduler_output,
+                    is_spec_step=False,
                     min_toks=min_toks,
                     tb_step=tb_step,
                 )
@@ -6935,7 +6932,6 @@ class TPUModelRunner(GPUModelRunner):
         verify_logits_paddings = self._verify_logits_paddings()
         with self._precompile_timed("thinking_budget"):
             self._thinking_budget.precompile(
-                device=self.device,
                 num_reqs_paddings=_rotate_precompile_sweep(
                     self.num_reqs_paddings, "thinking_budget"
                 ),
@@ -8818,6 +8814,9 @@ class TPUModelRunner(GPUModelRunner):
         if kernel_block_sizes is None:
             raise ValueError("kernel_block_sizes is required on TPU")
         super().may_reinitialize_input_batch(kv_cache_config)
+        # ThinkingBudgetTracker enforces thinking_token_budget; upstream's holder
+        # would make InputBatch.refresh_metadata run holder.sync_batch (prompt
+        # scans, unused per-row state) on every batch update.
         self.input_batch.thinking_budget_state_holder = None
         install_kernel_block_tables(self.input_batch.block_table, kernel_block_sizes)
         if self.input_batch.block_table:
