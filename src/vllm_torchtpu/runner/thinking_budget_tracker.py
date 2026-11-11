@@ -30,7 +30,6 @@ import numpy as np
 import torch
 
 from vllm_torchtpu.layers.adapter.sample import thinking_budget as tb_kernels
-from vllm_torchtpu.layers.adapter.sample.request_slot_table import RequestSlotTable
 from vllm_torchtpu.layers.adapter.sample.thinking_budget import (
     INT32_MAX,
     NO_FORCED_TOKEN,
@@ -42,6 +41,7 @@ from vllm_torchtpu.layers.adapter.sample.thinking_budget import (
     compute_sequence_state,
 )
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.runner.request_slot_table import RequestSlotTable
 
 if TYPE_CHECKING:
     from vllm import SamplingParams

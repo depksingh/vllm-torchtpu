@@ -29,7 +29,7 @@ from collections.abc import Set as AbstractSet
 import numpy as np
 import torch
 
-from vllm_torchtpu.layers.adapter.sample.scatter_ops import broadcast_amax_scatter
+from vllm_torchtpu.layers.adapter.sample.scatter_ops import seed_slot_rows
 
 
 def same_target_device(actual: torch.device, requested: torch.device) -> bool:
@@ -48,23 +48,6 @@ def same_target_device(actual: torch.device, requested: torch.device) -> bool:
         else 0
     )
     return actual.index == default_idx
-
-
-def scatter_slot_rows(
-    table: torch.Tensor, slot_ids: torch.Tensor, rows: torch.Tensor
-) -> torch.Tensor:
-    """Return ``table`` with ``out[slot_ids[i]] = rows[i]`` for ``slot_ids > 0``."""
-    return broadcast_amax_scatter(table, slot_ids, rows, slot_ids > 0)
-
-
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-def seed_slot_rows(
-    table: torch.Tensor,
-    seed_slots: torch.Tensor,
-    seed_values: torch.Tensor,
-) -> torch.Tensor:
-    """Scatter ``seed_values`` into ``table`` at active ``seed_slots > 0``."""
-    return scatter_slot_rows(table, seed_slots, seed_values)
 
 
 class RequestSlotTable[RowT: Sequence[int]]:

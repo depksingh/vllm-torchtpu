@@ -25,12 +25,10 @@ import torch
 from vllm.config.reasoning import ReasoningConfig
 
 from tests.runner.precompile_sweep_checks import ops_outside_aten as _ops_outside_aten
-from vllm_torchtpu.layers.adapter.sample import request_slot_table, thinking_budget
-from vllm_torchtpu.layers.adapter.sample.thinking_budget_tracker import (
-    ThinkingBudgetTracker,
-)
+from vllm_torchtpu.layers.adapter.sample import scatter_ops, thinking_budget
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import CANDIDATE_BLOCK
 from vllm_torchtpu.runner import tpu_runner
+from vllm_torchtpu.runner.thinking_budget_tracker import ThinkingBudgetTracker
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.structured_decoding import StructuredDecodingManager
 
@@ -252,7 +250,7 @@ def test_rotated_sweeps_hold_no_collective():
     next_toks = torch.full((n, 4), -1, dtype=torch.int32)
 
     graphs += _trace(
-        request_slot_table.seed_slot_rows,
+        scatter_ops.seed_slot_rows,
         state_table,
         slot_ids,
         torch.zeros((n, thinking_budget.NUM_STATE_COLS), dtype=torch.int32),
