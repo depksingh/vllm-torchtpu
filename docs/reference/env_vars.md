@@ -64,6 +64,7 @@ At startup, `vllm-torchtpu` reports set environment variables that neither vLLM 
 | `TPU_MOE_SEQUENCE_PARALLEL` | `False` | Enables sequence parallelism around MoE blocks. |
 | `TPU_ATTN_MOE_OVERLAP` | `False` | Overlaps Qwen3.5 MoE post-attention norm and router gate with TP collectives on token buckets >= 8 MiB per rank. |
 | `TPU_MOE_ROUTER_TOPK` | `"rowmax"` | MoE router top-k kernel implementation (`"rowmax"` or standard top-k). |
+| `TPU_MOE_SILU_BF16` | `False` | Opt-in. Rounds fused SwiGLU (`silu`) intermediate `gate`, `up`, and `silu(gate)` values to `bfloat16` in `fused_moe_gmm`'s `gmm_v2` kernel to match standalone `SiluAndMul` rounding in RL and distillation workloads. |
 | `TPU_MOE_FP8_ALL_GATHER` | `False` | Performs MoE activation all-gather in `fp8` before expert computation. |
 | `ENABLE_QUANTIZED_MATMUL_KERNEL` | `False` | Dispatches quantized linear layers to the custom Pallas quantized matmul kernel. |
 | `QUANTIZE_ON_LOAD_PREFIXES` | `[]` | Comma-separated dot-bounded module prefix names to quantize to FP8 on load (e.g., `"self_attn,shared_experts,layers.0.mlp"`), including `VocabParallelEmbedding` and `ParallelLMHead`. |
