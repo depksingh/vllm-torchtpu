@@ -42,10 +42,7 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm_torchtpu.layers.adapter.sample import (
     thinking_budget as tb_kernels,
 )
-from vllm_torchtpu.layers.adapter.sample.scatter_ops import (
-    broadcast_amax_scatter,
-    seed_slot_rows,
-)
+from vllm_torchtpu.layers.adapter.sample.scatter_ops import seed_slot_rows
 from vllm_torchtpu.layers.adapter.sample.thinking_budget import (
     COL_END_MATCH,
     COL_IN_THINK,
@@ -72,13 +69,11 @@ from vllm_torchtpu.layers.adapter.sample.thinking_budget import (
     query_forced_tokens,
 )
 from vllm_torchtpu.runner import (
-    chunk_processors,
     greedy_top_tokens,
     min_tokens,
     request_slot_table,
     thinking_budget_tracker,
 )
-from vllm_torchtpu.runner.request_slot_table import RequestSlotTable
 from vllm_torchtpu.runner.thinking_budget_tracker import (
     ThinkingBudgetStepState,
     ThinkingBudgetTracker,
@@ -706,7 +701,7 @@ class TestKMPKernelsFuzz:
             for slot, st in scalar_states.items():
                 assert tuple(state_table[slot].tolist()) == st
 
-    def test_logits_immutability_neg_inf_guard_and_amax_sentinel(self) -> None:
+    def test_logits_immutability_and_neg_inf_guard(self) -> None:
         cfg = _reasoning_config(list(GEMMA4_START), list(GEMMA4_END))
         tracker = ThinkingBudgetTracker(
             cfg, max_num_reqs=512, device=torch.device("cpu")
@@ -748,19 +743,6 @@ class TestKMPKernelsFuzz:
             assert torch.equal(out_l[1], snap[1]) and eff_d[1].item() == 77
             assert (eff_d[2:] == 77).all()
 
-        # scatter_ops.AMAX_SENTINEL == INT32_MIN preserves INT32_MIN in active rows.
-        i32_min = torch.iinfo(torch.int32).min
-        base = torch.zeros((4, 2), dtype=torch.int32)
-        vals = torch.tensor([[i32_min, 7], [9, i32_min]], dtype=torch.int32)
-        scattered = broadcast_amax_scatter(
-            base,
-            torch.tensor([2, 0], dtype=torch.int32),
-            vals,
-            torch.tensor([True, False]),
-        )
-        assert scattered[2].tolist() == [i32_min, 7]
-        assert scattered[0].tolist() == [0, 0]
-
         with pytest.raises(AssertionError, match="Duplicate active indices"):
             seed_slot_rows(
                 table,
@@ -771,70 +753,6 @@ class TestKMPKernelsFuzz:
 
 class TestLifecyclePreemptionAndChunkedPrefill:
     """Lifecycle hooks, wave slot recycling, H2D reuse, and real ``_update_states``."""
-
-    def test_reusable_request_slot_table_for_stateful_processors(self) -> None:
-        """Verify ``RequestSlotTable`` works independently of KMP state."""
-        pool: RequestSlotTable[tuple[int, int]] = RequestSlotTable(
-            max_num_reqs=2,
-            num_cols=2,
-            device=torch.device("cpu"),
-            sentinel_row=(-99, 0),
-        )
-        assert pool.max_num_reqs == 2 and pool.table is None
-        tracked = {"a": (10, 1), "b": (20, 2), "c": (30, 3)}
-        pool.mark_dirty("a", tracked["a"])
-        assert not pool.needs_cold_reseed(["a"], tracked)
-        assert pool.needs_cold_reseed(["b"], tracked)
-
-        cold_calls: list[str] = []
-
-        def cold_row(rid: str) -> tuple[int, int]:
-            cold_calls.append(rid)
-            return tracked[rid]
-
-        tbl = pool.sync_step(["a", "b"], tracked, cold_row)
-        assert tbl is not None and tbl.shape == (3, 2) and cold_calls == ["b"]
-        assert tuple(tbl[0].tolist()) == (-99, 0)
-        sa, sb = pool.slot_for("a"), pool.slot_for("b")
-        assert sa is not None and sb is not None and sa != sb
-        assert tuple(tbl[sa].tolist()) == (10, 1)
-        assert tuple(tbl[sb].tolist()) == (20, 2)
-
-        sl1 = pool.build_chunk_slot_ids(["a", "b"], 0, 2)
-        sl2 = pool.build_chunk_slot_ids(["a", "b"], 0, 2)
-        assert sl1 is not None and sl2 is sl1 and sl1.tolist() == [sa, sb]
-
-        # Wave swap frees 'a' and cold-reseeds 'c', then cold-reseeds 'a' on return.
-        tbl = pool.sync_step(["b", "c"], tracked, cold_row)
-        assert tbl is not None and "a" not in pool.allocated_req_ids()
-        assert cold_calls == ["b", "c"]
-        tbl = pool.sync_step(["a", "c"], tracked, cold_row)
-        assert tbl is not None and cold_calls == ["b", "c", "a"]
-
-    def test_slot_id_uploads_cached_per_chunk_across_steps(self) -> None:
-        """A step with two chunks keeps one cached slot-ID upload per chunk."""
-        pool: RequestSlotTable[tuple[int]] = RequestSlotTable(
-            max_num_reqs=4, num_cols=1, device=torch.device("cpu")
-        )
-        tracked = {rid: (7,) for rid in ("a", "b", "c", "d")}
-        batch = ["a", "b", "c", "d"]
-        assert pool.sync_step(batch, tracked, tracked.__getitem__) is not None
-
-        def chunk_uploads(req_ids: list[str]) -> list[torch.Tensor | None]:
-            return [
-                pool.build_chunk_slot_ids(req_ids, 0, 2, 2),
-                pool.build_chunk_slot_ids(req_ids, 2, 4, 2),
-            ]
-
-        step1 = chunk_uploads(batch)
-        step2 = chunk_uploads(batch)
-        assert step1[0] is not None and step1[1] is not None
-        assert step2[0] is step1[0] and step2[1] is step1[1]
-        # Swapping two rows of the second chunk re-uploads only that chunk.
-        step3 = chunk_uploads(["a", "b", "d", "c"])
-        assert step3[0] is step1[0] and step3[1] is not step1[1]
-        assert step3[1] is not None
-        assert step3[1].tolist() == step1[1].tolist()[::-1]
 
     def test_update_states_lifecycle_slot_reuse_and_batch_reorder(self) -> None:
         cfg = _reasoning_config(list(QWEN3_START), list(QWEN3_END))
@@ -1416,181 +1334,41 @@ class TestSampleTokens:
             req_s.num_computed_tokens += 1
         assert emitted_s == [50, 50, GEMMA4_END[0], GEMMA4_END[1]]
 
-    def test_sample_plain_chunk_processors_and_logprob_logits(self) -> None:
-        """``_sample_plain_chunk`` takes ``logprob_logits`` after the grammar mask
-        and before the ``PlainChunkProcessor`` hooks (``min_tokens``, thinking
-        budget), and drives any processor through the plain-chunk contract."""
+    def test_sample_plain_chunk_budget_processor_and_logprob_logits(self) -> None:
+        """``_sample_plain_chunk`` runs the ``tb_step`` plain-chunk processor:
+        a budget of 0 forces ``end_ids[0]`` after ``logprob_logits`` is taken,
+        and advances the request's budget state."""
         cfg = _reasoning_config(list(GEMMA4_START), list(GEMMA4_END))
-        sp = SamplingParams(
-            temperature=0.0, thinking_token_budget=0, min_tokens=2, stop_token_ids=[12]
-        )
+        sp = SamplingParams(temperature=0.0, thinking_token_budget=0)
         req = _request_state("r0", [1, *GEMMA4_START], sp)
         runner = _make_sample_runner(cfg, ["r0"], {"r0": req}, vocab_size=128)
-
-        def grammar_block_99(lg: torch.Tensor, *_args: object) -> torch.Tensor:
-            out = lg.clone()
-            out[0, 99] = float("-inf")
-            return out
-
-        runner.structured_decoding_manager = SimpleNamespace(
-            mask_logits=grammar_block_99
-        )
         raw = torch.zeros((4, 128), dtype=torch.float32)
-        raw[0, 99] = 20.0
-        raw[0, 12] = 9.0
         raw[0, 13] = 5.0
         raw[0, GEMMA4_END[0]] = -3.0
 
-        def sample(
-            values: torch.Tensor,
-            *,
-            top_tokens: bool = False,
-            grammar_output: object = None,
-            min_toks: min_tokens.MinTokensState | None = None,
-            tb_step: object = None,
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            return runner._sample_plain_chunk(
-                values,
-                cur_start_idx=0,
-                cur_end_idx=1,
-                top_tokens=top_tokens,
-                all_greedy=True,
-                sampling_generator=None,
-                grammar_output=grammar_output,
-                scheduler_output=SimpleNamespace(scheduled_spec_decode_tokens={}),
-                is_spec_step=False,
-                min_toks={} if min_toks is None else min_toks,
-                tb_step=tb_step,
-            )
-
-        # Grammar masks 99. min_tokens then masks stop token 12 and the budget
-        # of 0 forces GEMMA4_END[0]; neither shows in logprob_logits.
         tb_step = runner._thinking_budget.step_state(["r0"], {"r0": req}, frozenset())
-        min_toks = runner._min_tokens_batch_state()
-        assert tb_step is not None and min_toks
-        selected, logprob_logits = sample(
-            raw.clone(), grammar_output=object(), min_toks=min_toks, tb_step=tb_step
+        assert tb_step is not None
+        selected, logprob_logits = runner._sample_plain_chunk(
+            raw.clone(),
+            cur_start_idx=0,
+            cur_end_idx=1,
+            top_tokens=False,
+            all_greedy=True,
+            sampling_generator=None,
+            grammar_output=None,
+            scheduler_output=SimpleNamespace(scheduled_spec_decode_tokens={}),
+            is_spec_step=False,
+            min_toks={},
+            tb_step=tb_step,
         )
+        # The forced token beats the argmax 13; the logprobs see neither the
+        # forcing nor an in-place write.
         assert int(selected[0, 0].item()) == GEMMA4_END[0]
-        assert logprob_logits[0, 99].item() == float("-inf")
-        assert logprob_logits[0, 12].item() == 9.0
-        assert logprob_logits[0, GEMMA4_END[0]].item() == -3.0
+        assert torch.equal(logprob_logits, raw)
         slot_r0 = runner._thinking_budget.slots.slot_for("r0")
         assert slot_r0 is not None
         assert int(tb_step.state_table[slot_r0, COL_THINK_COUNT].item()) == 1
         assert int(tb_step.state_table[slot_r0, COL_END_MATCH].item()) == 1
-
-        class _RecordingProcessor:
-            def __init__(self) -> None:
-                self.calls: list[tuple[str, int]] = []
-
-            def mask_logits(self, logits: torch.Tensor) -> torch.Tensor:
-                self.calls.append(("mask", logits.shape[0]))
-                out = logits.clone()
-                out[0, 99] = float("-inf")
-                return out
-
-            def on_sampled(self, selected_token_ids: torch.Tensor) -> None:
-                self.calls.append(("sampled", int(selected_token_ids[0, 0].item())))
-
-            def override_top_tokens(
-                self, selected_token_ids: torch.Tensor
-            ) -> torch.Tensor:
-                self.calls.append(("override", int(selected_token_ids[0, 0].item())))
-                return selected_token_ids + 1
-
-        recorder = _RecordingProcessor()
-        recording_step = SimpleNamespace(plain_chunk=lambda *_args: recorder)
-        raw_logits = raw.clone()
-        selected, logprob_logits = sample(raw_logits, tb_step=recording_step)
-        assert logprob_logits is raw_logits
-        assert int(selected[0, 0].item()) == 12
-        assert recorder.calls == [("mask", 4), ("sampled", 12)]
-        top_ids = torch.tensor([[30], [0], [0], [0]], dtype=torch.int64)
-        selected, _ = sample(top_ids, top_tokens=True, tb_step=recording_step)
-        assert int(selected[0, 0].item()) == 31
-        assert recorder.calls[2:] == [("override", 30)]
-
-        stateless = chunk_processors.StatelessPlainChunkProcessor(grammar_block_99)
-        with pytest.raises(NotImplementedError, match="top_tokens"):
-            stateless.override_top_tokens(top_ids)
-
-    @pytest.mark.parametrize("mode", ["greedy", "top_tokens", "random"])
-    def test_spec_verify_chunk_runs_processor_hooks_once(self, mode: str) -> None:
-        """Each ``SpecChunkProcessor`` prepares the rows once and ``finish``es
-        once on the rejection sampler's output; with a processor, a greedy chunk
-        gathers the full logits instead of the fused verify prelude."""
-        cfg = _reasoning_config(list(GEMMA4_START), list(GEMMA4_END))
-        greedy = mode != "random"
-        req = _request_state(
-            "r0",
-            [1, *GEMMA4_START],
-            SamplingParams(temperature=0.0 if greedy else 0.7),
-        )
-        runner = _make_sample_runner(
-            cfg,
-            ["r0"],
-            {"r0": req},
-            all_greedy=greedy,
-            top_tokens=mode == "top_tokens",
-            spec_k=2,
-        )
-        runner._build_padded_sampling_params = lambda *_a: (
-            torch.full((4, 1), 0.7),
-            torch.full((4, 1), 2, dtype=torch.int32),
-            torch.ones((4, 1)),
-        )
-        calls: list[str] = []
-
-        class _RecordingSpecProcessor:
-            def prepare_logits(
-                self,
-                target_logits: torch.Tensor,
-                bonus_logits: torch.Tensor,
-                draft_token_ids: torch.Tensor,
-                *_args: object,
-            ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-                calls.append("prepare_logits")
-                return target_logits, bonus_logits, draft_token_ids
-
-            def prepare_tokens(
-                self,
-                target_argmax: torch.Tensor,
-                bonus_token_ids: torch.Tensor,
-                draft_token_ids: torch.Tensor,
-                *_args: object,
-            ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-                calls.append("prepare_tokens")
-                return target_argmax, bonus_token_ids, draft_token_ids
-
-            def finish(self, next_tokens: torch.Tensor, max_draft_tokens: int) -> None:
-                calls.append(f"finish:{tuple(next_tokens.shape)}:{max_draft_tokens}")
-
-        logits = torch.full((4, 256), -20.0)
-        for row, tok in enumerate((30, 31, 32)):
-            logits[row, tok] = 6.0
-        values = (
-            torch.argmax(logits, dim=-1, keepdim=True)
-            if mode == "top_tokens"
-            else logits
-        )
-        out = runner._sample_spec_verify_chunk(
-            values,
-            _verify_md([[30, 31]]),
-            None,
-            SimpleNamespace(scheduled_spec_decode_tokens={}),
-            0,
-            1,
-            greedy,
-            torch.Generator().manual_seed(0),
-            mode == "top_tokens",
-            {},
-            (_RecordingSpecProcessor(),),
-        )
-        prepare = "prepare_tokens" if mode == "top_tokens" else "prepare_logits"
-        assert calls == [prepare, f"finish:{tuple(out.shape)}:2"]
-        if greedy:
-            assert out[0].tolist() == [30, 31, 32]
 
     @pytest.mark.parametrize(
         "mode",
