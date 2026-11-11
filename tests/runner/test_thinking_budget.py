@@ -72,9 +72,9 @@ from vllm_torchtpu.layers.adapter.sample.thinking_budget import (
     query_forced_tokens,
 )
 from vllm_torchtpu.runner import (
+    chunk_processors,
     greedy_top_tokens,
     min_tokens,
-    plain_chunk_sampler,
     request_slot_table,
     thinking_budget_tracker,
 )
@@ -1549,81 +1549,181 @@ class TestSampleTokens:
             req_s.num_computed_tokens += 1
         assert emitted_s == [50, 50, GEMMA4_END[0], GEMMA4_END[1]]
 
-    def test_sample_plain_chunk_custom_logits_processors(self) -> None:
-        """Verify ``sample_plain_chunk`` captures post-grammar ``logprob_logits``
-        and runs stateful ``PlainChunkProcessor`` hooks alongside thinking budget."""
+    def test_sample_plain_chunk_processors_and_logprob_logits(self) -> None:
+        """``_sample_plain_chunk`` takes ``logprob_logits`` after the grammar mask
+        and before the ``PlainChunkProcessor`` hooks (``min_tokens``, thinking
+        budget), and drives any processor through the plain-chunk contract."""
         cfg = _reasoning_config(list(GEMMA4_START), list(GEMMA4_END))
-        sp = SamplingParams(temperature=0.0, thinking_token_budget=0)
+        sp = SamplingParams(
+            temperature=0.0, thinking_token_budget=0, min_tokens=2, stop_token_ids=[12]
+        )
         req = _request_state("r0", [1, *GEMMA4_START], sp)
-        tracker = ThinkingBudgetTracker(cfg, max_num_reqs=4, device=torch.device("cpu"))
-        tracker.add("r0", sp, req.prompt_token_ids)
-        tb_step = tracker.step_state(["r0"], {"r0": req}, frozenset())
-        assert tb_step is not None
-        tb_proc = tb_step.plain_chunk(["r0"], 0, 1)
-        assert tb_proc is not None
+        runner = _make_sample_runner(cfg, ["r0"], {"r0": req}, vocab_size=128)
 
-        raw = torch.zeros((4, 128), dtype=torch.float32)
-        raw[0, 99] = 20.0
-        raw[0, 12] = 9.0
-        raw[0, 13] = 5.0
-
-        def grammar_block_99(lg: torch.Tensor) -> torch.Tensor:
+        def grammar_block_99(lg: torch.Tensor, *_args: object) -> torch.Tensor:
             out = lg.clone()
             out[0, 99] = float("-inf")
             return out
 
+        runner.structured_decoding_manager = SimpleNamespace(
+            mask_logits=grammar_block_99
+        )
+        raw = torch.zeros((4, 128), dtype=torch.float32)
+        raw[0, 99] = 20.0
+        raw[0, 12] = 9.0
+        raw[0, 13] = 5.0
+        raw[0, GEMMA4_END[0]] = -3.0
+
+        def sample(
+            values: torch.Tensor,
+            *,
+            top_tokens: bool = False,
+            grammar_output: object = None,
+            min_toks: min_tokens.MinTokensState | None = None,
+            tb_step: object = None,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            return runner._sample_plain_chunk(
+                values,
+                cur_start_idx=0,
+                cur_end_idx=1,
+                top_tokens=top_tokens,
+                all_greedy=True,
+                sampling_generator=None,
+                grammar_output=grammar_output,
+                scheduler_output=SimpleNamespace(scheduled_spec_decode_tokens={}),
+                is_spec_step=False,
+                min_toks={} if min_toks is None else min_toks,
+                tb_step=tb_step,
+            )
+
+        # Grammar masks 99. min_tokens then masks stop token 12 and the budget
+        # of 0 forces GEMMA4_END[0]; neither shows in logprob_logits.
+        tb_step = runner._thinking_budget.step_state(["r0"], {"r0": req}, frozenset())
+        min_toks = runner._min_tokens_batch_state()
+        assert tb_step is not None and min_toks
+        selected, logprob_logits = sample(
+            raw.clone(), grammar_output=object(), min_toks=min_toks, tb_step=tb_step
+        )
+        assert int(selected[0, 0].item()) == GEMMA4_END[0]
+        assert logprob_logits[0, 99].item() == float("-inf")
+        assert logprob_logits[0, 12].item() == 9.0
+        assert logprob_logits[0, GEMMA4_END[0]].item() == -3.0
+        slot_r0 = runner._thinking_budget.slots.slot_for("r0")
+        assert slot_r0 is not None
+        assert int(tb_step.state_table[slot_r0, COL_THINK_COUNT].item()) == 1
+        assert int(tb_step.state_table[slot_r0, COL_END_MATCH].item()) == 1
+
         class _RecordingProcessor:
             def __init__(self) -> None:
-                self.sampled: list[int] = []
+                self.calls: list[tuple[str, int]] = []
 
             def mask_logits(self, logits: torch.Tensor) -> torch.Tensor:
+                self.calls.append(("mask", logits.shape[0]))
                 out = logits.clone()
-                out[0, GEMMA4_END[0]] = float("-inf")
-                out[0, 12] = float("-inf")
+                out[0, 99] = float("-inf")
                 return out
 
             def on_sampled(self, selected_token_ids: torch.Tensor) -> None:
-                self.sampled.append(int(selected_token_ids[0, 0].item()))
+                self.calls.append(("sampled", int(selected_token_ids[0, 0].item())))
 
             def override_top_tokens(
                 self, selected_token_ids: torch.Tensor
             ) -> torch.Tensor:
-                return selected_token_ids
+                self.calls.append(("override", int(selected_token_ids[0, 0].item())))
+                return selected_token_ids + 1
 
         recorder = _RecordingProcessor()
-        selected, logprob_logits = plain_chunk_sampler.sample_plain_chunk(
-            raw,
-            cur_start_idx=0,
-            cur_end_idx=1,
-            top_tokens=False,
-            all_greedy=True,
-            sampling_generator=None,
-            sample_stage=nullcontext(),
-            greedy_sample_fn=lambda x: torch.argmax(x, dim=-1, keepdim=True),
-            grammar_mask_fn=grammar_block_99,
-            processors=(recorder, tb_proc),
-        )
-        assert logprob_logits[0, 99].item() == float("-inf")
-        assert logprob_logits[0, 12].item() == 9.0
-        assert logprob_logits[0, GEMMA4_END[0]].item() == 0.0
-        assert int(selected[0, 0].item()) == 13
-        assert recorder.sampled == [13]
-        slot_r0 = tracker.slots.slot_for("r0")
-        assert slot_r0 == 1
-        assert int(tb_step.state_table[slot_r0, COL_THINK_COUNT].item()) == 1
+        recording_step = SimpleNamespace(plain_chunk=lambda *_args: recorder)
+        raw_logits = raw.clone()
+        selected, logprob_logits = sample(raw_logits, tb_step=recording_step)
+        assert logprob_logits is raw_logits
+        assert int(selected[0, 0].item()) == 12
+        assert recorder.calls == [("mask", 4), ("sampled", 12)]
+        top_ids = torch.tensor([[30], [0], [0], [0]], dtype=torch.int64)
+        selected, _ = sample(top_ids, top_tokens=True, tb_step=recording_step)
+        assert int(selected[0, 0].item()) == 31
+        assert recorder.calls[2:] == [("override", 30)]
 
-        stateless = plain_chunk_sampler.StatelessPlainChunkProcessor(grammar_block_99)
+        stateless = chunk_processors.StatelessPlainChunkProcessor(grammar_block_99)
         with pytest.raises(NotImplementedError, match="top_tokens"):
-            plain_chunk_sampler.sample_plain_chunk(
-                torch.tensor([[12]], dtype=torch.int64),
-                cur_start_idx=0,
-                cur_end_idx=1,
-                top_tokens=True,
-                all_greedy=True,
-                sampling_generator=None,
-                sample_stage=nullcontext(),
-                processors=(stateless,),
-            )
+            stateless.override_top_tokens(top_ids)
+
+    @pytest.mark.parametrize("mode", ["greedy", "top_tokens", "random"])
+    def test_spec_verify_chunk_runs_processor_hooks_once(self, mode: str) -> None:
+        """Each ``SpecChunkProcessor`` prepares the rows once and ``finish``es
+        once on the rejection sampler's output; with a processor, a greedy chunk
+        gathers the full logits instead of the fused verify prelude."""
+        cfg = _reasoning_config(list(GEMMA4_START), list(GEMMA4_END))
+        greedy = mode != "random"
+        req = _request_state(
+            "r0",
+            [1, *GEMMA4_START],
+            SamplingParams(temperature=0.0 if greedy else 0.7),
+        )
+        runner = _make_sample_runner(
+            cfg,
+            ["r0"],
+            {"r0": req},
+            all_greedy=greedy,
+            top_tokens=mode == "top_tokens",
+            spec_k=2,
+        )
+        runner._build_padded_sampling_params = lambda *_a: (
+            torch.full((4, 1), 0.7),
+            torch.full((4, 1), 2, dtype=torch.int32),
+            torch.ones((4, 1)),
+        )
+        calls: list[str] = []
+
+        class _RecordingSpecProcessor:
+            def prepare_logits(
+                self,
+                target_logits: torch.Tensor,
+                bonus_logits: torch.Tensor,
+                draft_token_ids: torch.Tensor,
+                *_args: object,
+            ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                calls.append("prepare_logits")
+                return target_logits, bonus_logits, draft_token_ids
+
+            def prepare_tokens(
+                self,
+                target_argmax: torch.Tensor,
+                bonus_token_ids: torch.Tensor,
+                draft_token_ids: torch.Tensor,
+                *_args: object,
+            ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                calls.append("prepare_tokens")
+                return target_argmax, bonus_token_ids, draft_token_ids
+
+            def finish(self, next_tokens: torch.Tensor, max_draft_tokens: int) -> None:
+                calls.append(f"finish:{tuple(next_tokens.shape)}:{max_draft_tokens}")
+
+        logits = torch.full((4, 256), -20.0)
+        for row, tok in enumerate((30, 31, 32)):
+            logits[row, tok] = 6.0
+        values = (
+            torch.argmax(logits, dim=-1, keepdim=True)
+            if mode == "top_tokens"
+            else logits
+        )
+        out = runner._sample_spec_verify_chunk(
+            values,
+            _verify_md([[30, 31]]),
+            None,
+            SimpleNamespace(scheduled_spec_decode_tokens={}),
+            0,
+            1,
+            greedy,
+            torch.Generator().manual_seed(0),
+            mode == "top_tokens",
+            {},
+            (_RecordingSpecProcessor(),),
+        )
+        prepare = "prepare_tokens" if mode == "top_tokens" else "prepare_logits"
+        assert calls == [prepare, f"finish:{tuple(out.shape)}:2"]
+        if greedy:
+            assert out[0].tolist() == [30, 31, 32]
 
     @pytest.mark.parametrize(
         "mode",

@@ -46,6 +46,7 @@ from vllm_torchtpu.runner.request_slot_table import RequestSlotTable
 if TYPE_CHECKING:
     from vllm import SamplingParams
     from vllm.config.reasoning import ReasoningConfig
+    from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
 logger = init_logger(__name__)
@@ -65,10 +66,11 @@ def _compute_request_state(
     """Reconstruct KMP state from ``req_state``'s prompt and committed outputs.
 
     Placeholder invariants:
-    * ``on_resumed`` runs in ``TPUModelRunner._update_states`` after
-      ``super()._update_states`` aligns ``req_state.output_token_ids`` to the
-      scheduler's committed ``num_output_tokens``; negative scheduler
-      placeholders are skipped by ``out_arr >= 0``.
+    * ``update_states`` (and so ``on_resumed``) runs in
+      ``TPUModelRunner._update_states`` after ``super()._update_states``
+      aligns ``req_state.output_token_ids`` to the scheduler's committed
+      ``num_output_tokens``; negative scheduler placeholders are skipped by
+      ``out_arr >= 0``.
     * ``prepare_step`` only calls ``_compute_request_state`` on a cold reseed
       when a budgeted request has neither an allocated slot nor a staged dirty
       entry; ``TPUModelRunner.sample_tokens`` settles any in-flight
@@ -126,6 +128,29 @@ class ThinkingBudgetTracker:
     def __bool__(self) -> bool:
         return self._markers is not None and bool(self._budgets)
 
+    def update_states(
+        self,
+        scheduler_output: SchedulerOutput,
+        req_id_to_index: Container[str],
+        requests: Mapping[str, CachedRequestState],
+    ) -> None:
+        """Apply one step's request lifecycle changes, in order.
+
+        Runs after ``GPUModelRunner._update_states`` has updated
+        ``input_batch`` (``req_id_to_index``) and ``requests``: drops finished
+        requests, frees the slots of preempted requests and of budgeted
+        requests no longer in the batch, registers new requests, then reseeds
+        resumed requests from their committed outputs.
+        """
+        self.discard(scheduler_output.finished_req_ids)
+        self.on_preempted(scheduler_output.preempted_req_ids)
+        self._slots.release_unscheduled(req_id_to_index)
+        for new_req in scheduler_output.scheduled_new_reqs:
+            self.add(new_req.req_id, new_req.sampling_params, new_req.prompt_token_ids)
+        resumed_req_ids = scheduler_output.scheduled_cached_reqs.resumed_req_ids
+        if resumed_req_ids:
+            self.on_resumed(resumed_req_ids, requests)
+
     def discard(self, req_ids: Iterable[str]) -> None:
         if not self._budgets:
             return
@@ -138,10 +163,6 @@ class ThinkingBudgetTracker:
         if not req_ids or not self._budgets:
             return
         self._slots.release(r for r in req_ids if r in self._budgets)
-
-    def release_unscheduled(self, active_req_ids: Container[str]) -> None:
-        """Free slots for budgeted requests no longer in ``input_batch``."""
-        self._slots.release_unscheduled(active_req_ids)
 
     def add(
         self,
@@ -435,7 +456,7 @@ class ThinkingBudgetPlainChunk:
 
 @dataclass(frozen=True)
 class ThinkingBudgetSpecChunk:
-    """Speculative verification forcing/advance handle for one batch chunk."""
+    """``SpecChunkProcessor`` handle for one speculative verify chunk."""
 
     step: ThinkingBudgetStepState
     slot_ids: torch.Tensor
