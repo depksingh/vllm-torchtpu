@@ -253,12 +253,12 @@ def prepare_routed_gmm_inputs(
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """Prepare the local-only routing layout using already-local expert ids.
 
-    For non-EP runs `topk_indices_local` is always non-negative, so the
-    valid-mask path computed below is a no-op (jnp.where on an all-True
-    mask). For EP, the caller applies the expert-map remap upstream
-    (inside this JIT) and marks non-local entries with a negative id which
-    the mask filters out. Always running the masked branch keeps a single
-    code path.
+    For non-EP runs `topk_indices_local` is always non-negative, so without
+    skip_padded_tokens every route is valid: the mask is all True and the
+    expert ids are sorted as they are, with no bucket for invalid routes.
+    For EP, the caller applies the expert-map remap upstream (inside this
+    JIT) and marks non-local entries with a negative id which the mask
+    filters out.
     """
     num_tokens_local = hidden_states_local.shape[0]
     topk_indices_flat = topk_indices_local.flatten()
@@ -454,10 +454,18 @@ def moe_gmm(
     token_hidden = gmm2_res[argsort_revert_indices]
     token_topk_hidden = token_hidden.reshape(
         (num_tokens, topk, gmm2_res.shape[-1]))
-    if use_ep or skip_padded_tokens:
-        topk_weights = jnp.where(valid_mask, topk_weights, 0)
+    # Without EP or skip_padded_tokens every gathered row was computed (and
+    # the mask is all True in production), so zeroing the masked routes'
+    # weights is enough there.
+    topk_weights = jnp.where(valid_mask, topk_weights, 0)
     token_topk_hidden = token_topk_hidden * jnp.expand_dims(topk_weights,
                                                             axis=-1)
+    if use_ep or skip_padded_tokens:
+        # Invalid routes sort past sum(group_sizes), whose rows both GMMs
+        # leave unwritten (zero_initialize=False). Those rows can hold NaN or
+        # Inf, which a zero weight does not clear (NaN * 0 is NaN).
+        token_topk_hidden = jnp.where(valid_mask[:, :, None],
+                                      token_topk_hidden, 0)
     # FP32 top-k weights can promote BF16 outputs; keep the custom-op dtype.
     return token_topk_hidden.sum(axis=1).astype(x.dtype)
 
