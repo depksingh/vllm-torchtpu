@@ -21,6 +21,7 @@ import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
 from jax import lax
 
+from vllm_torchtpu.kernels import pallas_compat
 # yapf: disable
 from vllm_torchtpu.kernels.experimental.batched_rpa import (bref_override,
                                                             configs,
@@ -282,7 +283,7 @@ def rpa_body(
     def _load_and_mask_v() -> jax.Array:
         v_list = []
         if cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
-            base_kv_iota = pltpu.repeat(
+            base_kv_iota = pallas_compat.repeat(
                 jnp.arange(cfgs.bkv_sz, dtype=int_ty),
                 cfgs.aligned_kv_head_dim,
                 axis=0,
