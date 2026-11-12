@@ -848,7 +848,9 @@ def zero_out_end(
     dims: Dimensions,
 ):
     out_dma = out_ref.reshape(-1, dims.size_lhs_sublane, out_ref.shape[-1])
-    pltpu.make_async_copy(
+    # The wait hints are forwarded only by a Pallas build whose DMA wait
+    # takes them.
+    pallas_compat.make_async_copy(
         src_ref=out_dma.at[pl.ds(0, zero_size)],
         dst_ref=out_dma.at[pl.ds(0, zero_size)],
         sem=semaphore_ref.at[0],
