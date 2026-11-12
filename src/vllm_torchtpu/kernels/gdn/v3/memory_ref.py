@@ -21,6 +21,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels import pallas_compat
 from vllm_torchtpu.kernels.gdn.v3 import config
 
 
@@ -126,7 +127,7 @@ class MetadataRef:
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
-class BaseBufferedRef(pltpu.BufferedRef):
+class BaseBufferedRef(pallas_compat.BufferedRef):
 
     cfg: config.GDNConfig = dataclasses.field(metadata=dict(static=True))
     # NOTE: Despite being ref, metadata_ref should be set to static. This is
@@ -146,7 +147,7 @@ class BaseBufferedRef(pltpu.BufferedRef):
         metadata_ref: MetadataRef,
         **fields,
     ):
-        standard_ref = pltpu.BufferedRef.create(
+        standard_ref = pallas_compat.BufferedRef.create(
             spec=spec,
             dtype_or_type=dtype_or_type,
             buffer_type=buffer_type,
@@ -162,7 +163,7 @@ class BaseBufferedRef(pltpu.BufferedRef):
             **fields,
             **{
                 f.name: getattr(standard_ref, f.name)
-                for f in dataclasses.fields(pltpu.BufferedRef)
+                for f in dataclasses.fields(pallas_compat.BufferedRef)
             },
         )
 
@@ -182,7 +183,7 @@ class InBufferedRef(BaseBufferedRef):
         for idx in range(self.cfg.seq_tile_size):
             r_base = self.metadata_ref.p_id_to_r_base[p_id, idx]
             dma_size = self.metadata_ref.p_id_to_r_size[p_id, idx]
-            pltpu.make_async_copy(
+            pallas_compat.make_async_copy(
                 src_ref.at[pl.ds(r_base, dma_size)],
                 vmem_ref.at[idx, pl.ds(0, dma_size)],
                 sem,
@@ -203,7 +204,7 @@ class InBufferedRef(BaseBufferedRef):
         for idx in range(self.cfg.seq_tile_size):
             dma_size += self.metadata_ref.p_id_to_r_size[p_id, idx]
 
-        pltpu.make_async_copy(
+        pallas_compat.make_async_copy(
             vmem_ref.at[0, pl.ds(0, dma_size)],
             vmem_ref.at[0, pl.ds(0, dma_size)],
             sem,
@@ -225,7 +226,7 @@ class OutBufferedRef(BaseBufferedRef):
         for idx in range(self.cfg.seq_tile_size):
             r_base = self.metadata_ref.p_id_to_r_base[p_id, idx]
             dma_size = self.metadata_ref.p_id_to_r_size[p_id, idx]
-            pltpu.make_async_copy(
+            pallas_compat.make_async_copy(
                 vmem_ref.at[idx, pl.ds(0, dma_size)],
                 dst_ref.at[pl.ds(r_base, dma_size)],
                 sem,
@@ -246,7 +247,7 @@ class OutBufferedRef(BaseBufferedRef):
         for idx in range(self.cfg.seq_tile_size):
             dma_size += self.metadata_ref.p_id_to_r_size[p_id, idx]
 
-        pltpu.make_async_copy(
+        pallas_compat.make_async_copy(
             vmem_ref.at[0, pl.ds(0, dma_size)],
             vmem_ref.at[0, pl.ds(0, dma_size)],
             sem,
@@ -314,7 +315,7 @@ class StateBufferedRef(BaseBufferedRef):
             # Resume from the checkpoint of the last accepted token.
             state_idx += self._read_offset(s_idx)
 
-            pltpu.make_async_copy(
+            pallas_compat.make_async_copy(
                 self._src_slice(src_ref, state_idx, dma_size),
                 vmem_ref.at[idx, pl.ds(0, dma_size)],
                 sem,
@@ -346,7 +347,7 @@ class StateBufferedRef(BaseBufferedRef):
         @pl.when(dma_size > 0)
         def _():
             wait_ref = self._wait_slice(vmem_ref, dma_size)
-            pltpu.make_async_copy(
+            pallas_compat.make_async_copy(
                 wait_ref, wait_ref,
                 sem).wait(strict_ordering=self.strict_ordering)
 
@@ -370,7 +371,7 @@ class StateBufferedRef(BaseBufferedRef):
             num_ckpts = jnp.minimum(r_size, self.cfg.window_size)
             dma_size = jnp.where(is_last_tile, num_ckpts * self._unit(), 0)
 
-            pltpu.make_async_copy(
+            pallas_compat.make_async_copy(
                 vmem_ref.at[idx, pl.ds(0, dma_size)],
                 self._src_slice(dst_ref, state_idx, dma_size),
                 sem,
@@ -400,7 +401,7 @@ class StateBufferedRef(BaseBufferedRef):
         @pl.when(dma_size > 0)
         def _():
             wait_ref = self._wait_slice(vmem_ref, dma_size)
-            pltpu.make_async_copy(
+            pallas_compat.make_async_copy(
                 wait_ref, wait_ref,
                 sem).wait(strict_ordering=self.strict_ordering)
 
@@ -482,7 +483,7 @@ class ExternalStateBufferedRef(StateBufferedRef):
             read_ckpt = self.metadata_ref.s_idx_to_read_offset[s_idx]
             state_idx = self._ckpt_state_idx(s_idx, read_ckpt)
 
-            pltpu.make_async_copy(
+            pallas_compat.make_async_copy(
                 self._region_slice(src_ref, state_idx, nblocks),
                 vmem_ref.at[idx, 0, pl.ds(0, nblocks)],
                 sem,
@@ -516,7 +517,7 @@ class ExternalStateBufferedRef(StateBufferedRef):
             num_ckpts = jnp.minimum(r_size, self.cfg.window_size)
             dma_size = jnp.where(is_last_tile, num_ckpts * self._unit(), 0)
 
-            pltpu.make_async_copy(
+            pallas_compat.make_async_copy(
                 vmem_ref.at[idx, 0, pl.ds(0, dma_size)],
                 self.compact_output_ref.at[s_idx, pl.ds(0, dma_size)],
                 sem,
@@ -549,7 +550,7 @@ class ExternalStateBufferedRef(StateBufferedRef):
                 should_write = jnp.logical_and(is_last_tile, t < num_ckpts)
                 nblocks = jnp.where(should_write, self.region.nblocks, 0)
                 state_idx = self._ckpt_state_idx(s_idx, t)
-                pltpu.make_async_copy(
+                pallas_compat.make_async_copy(
                     vmem_ref.at[idx, t, pl.ds(0, nblocks)],
                     self._region_slice(dst_ref, state_idx, nblocks),
                     sem,
@@ -583,7 +584,7 @@ class ExternalStateBufferedRef(StateBufferedRef):
         @pl.when(dma_size > 0)
         def _():
             wait_ref = vmem_ref.at[0, pl.ds(0, dma_size)]
-            pltpu.make_async_copy(
+            pallas_compat.make_async_copy(
                 wait_ref, wait_ref,
                 sem).wait(strict_ordering=self.strict_ordering)
 
@@ -608,7 +609,7 @@ class ExternalStateBufferedRef(StateBufferedRef):
         @pl.when(dma_size > 0)
         def _():
             wait_ref = vmem_ref.at[0, pl.ds(0, dma_size)]
-            pltpu.make_async_copy(
+            pallas_compat.make_async_copy(
                 wait_ref, wait_ref,
                 sem).wait(strict_ordering=self.strict_ordering)
 
