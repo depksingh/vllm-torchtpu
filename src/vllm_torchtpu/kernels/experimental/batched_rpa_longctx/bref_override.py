@@ -19,13 +19,18 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels import pallas_compat
 from vllm_torchtpu.kernels.experimental.batched_rpa_longctx import (configs,
                                                                     schedule)
+
+# The DMA hints `priority` / `strict_ordering` are pallas_compat.BufferedRef
+# fields. On public JAX only `priority` reaches the DMAs: its Pallas has no
+# `strict_ordering` and lowers every DMA as if it were False.
 
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
-class _BypassRef(pltpu.BufferedRef):
+class _BypassRef(pallas_compat.BufferedRef):
     """Helper class to safely bypass buffer_count checks during creation."""
 
     def __post_init__(self):
@@ -69,7 +74,7 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
             cfgs=cfgs,
             **{
                 f.name: getattr(standard_ref, f.name)
-                for f in dataclasses.fields(pltpu.BufferedRef)
+                for f in dataclasses.fields(pallas_compat.BufferedRef)
             },
         )
 
@@ -96,7 +101,7 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
                 sz = pl.multiple_of(sz, num_lanes)
                 # kv_cache_hbm: (num_pages, num_kv_heads * 2, kv_head_dim // packing, packing, page_size)
                 # vmem_dst_lane: (batch_size, num_kv_heads * 2, kv_head_dim // packing, packing, page_size)
-                pltpu.make_async_copy(
+                pallas_compat.make_async_copy(
                     kv_cache_hbm.at[hbm_p_idx, :, :, :,
                                     pl.ds(0, sz)],
                     vmem_dst_lane.at[b, :, :, :,
@@ -118,7 +123,7 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
                 sz = pl.multiple_of(sz, 128)
                 # new_kv_hbm: (num_kv_heads * 2, kv_head_dim // packing, packing, total_new_tokens)
                 # vmem_dst_lane: (batch_size, num_kv_heads * 2, kv_head_dim // packing, packing, page_size)
-                pltpu.make_async_copy(
+                pallas_compat.make_async_copy(
                     new_kv_hbm.at[:, :, :, pl.ds(src_new_off, sz)],
                     vmem_dst_lane.at[b, :, :, :,
                                      pl.ds(dst_vmem_off, sz)],
@@ -151,7 +156,7 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
                                dma_valid * self.cfgs.serve.page_size, 0)
                 src_vmem_off = pl.multiple_of(src_vmem_off, 128)
                 sz = pl.multiple_of(sz, 128)
-                pltpu.make_async_copy(
+                pallas_compat.make_async_copy(
                     vmem_src_lane.at[b, :, :, :,
                                      pl.ds(src_vmem_off, sz)],
                     kv_out_ref.at[hbm_p_idx, :, :, :,
@@ -177,7 +182,7 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
         vmem_u32 = vmem_dst.bitcast(jnp.uint32)
         flat_dst = vmem_u32.reshape((-1, 128))
         # (batch_size, num_kv_heads * 2, kv_head_dim // packing, packing, page_size)
-        pltpu.make_async_copy(
+        pallas_compat.make_async_copy(
             flat_dst.at[pl.ds(0, wait_lanes), :],
             flat_dst.at[pl.ds(0, wait_lanes), :],
             sem,
@@ -197,7 +202,7 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
         vmem_src = self.window_ref.at[slot]
         vmem_u32 = vmem_src.bitcast(jnp.uint32)
         flat_src = vmem_u32.reshape((-1, 128))
-        pltpu.make_async_copy(
+        pallas_compat.make_async_copy(
             flat_src.at[pl.ds(0, wait_lanes), :],
             flat_src.at[pl.ds(0, wait_lanes), :],
             sem,
@@ -239,7 +244,7 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
             cfgs=cfgs,
             **{
                 f.name: getattr(standard_ref, f.name)
-                for f in dataclasses.fields(pltpu.BufferedRef)
+                for f in dataclasses.fields(pallas_compat.BufferedRef)
             },
         )
 
@@ -281,7 +286,7 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
 
         for i in range(len(dma_list_cache)):
             src_off, dst_off, sz, b = dma_list_cache[i]
-            pltpu.make_async_copy(
+            pallas_compat.make_async_copy(
                 kv_cache_hbm_flat.at[pl.ds(src_off, sz)],
                 vmem_dst.at[b, pl.ds(dst_off, sz)],
                 sem,
@@ -292,7 +297,7 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
 
         for i in range(len(dma_list_new)):
             src_off, dst_off, sz, b = dma_list_new[i]
-            pltpu.make_async_copy(
+            pallas_compat.make_async_copy(
                 new_kv_hbm.at[pl.ds(src_off, sz)],
                 vmem_dst.at[b, pl.ds(dst_off, sz)],
                 sem,
@@ -326,7 +331,7 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
                 dst_hbm_off = (page_indices_ref[global_p_idx] <<
                                self.cfgs.serve.page_size_log2) | p_off
                 sz = jnp.where(do_writeback, new_sz, 0)
-                pltpu.make_async_copy(
+                pallas_compat.make_async_copy(
                     vmem_src.at[b, pl.ds(src_vmem_off, sz)],
                     kv_out_ref_flat.at[pl.ds(dst_hbm_off, sz)],
                     sem,
@@ -349,7 +354,7 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
         vmem_dst = self.window_ref.at[slot]
         vmem_u32 = vmem_dst.bitcast(jnp.uint32)
         flat_dst = vmem_u32.reshape((-1, 128))
-        pltpu.make_async_copy(
+        pallas_compat.make_async_copy(
             flat_dst.at[pl.ds(0, wait_lanes), :],
             flat_dst.at[pl.ds(0, wait_lanes), :],
             sem,
@@ -369,7 +374,7 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
         vmem_src = self.window_ref.at[slot]
         vmem_u32 = vmem_src.bitcast(jnp.uint32)
         flat_src = vmem_u32.reshape((-1, 128))
-        pltpu.make_async_copy(
+        pallas_compat.make_async_copy(
             flat_src.at[pl.ds(0, wait_lanes), :],
             flat_src.at[pl.ds(0, wait_lanes), :],
             sem,
@@ -378,7 +383,7 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, kw_only=True)
-class BatchingORef(pltpu.BufferedRef):
+class BatchingORef(pallas_compat.BufferedRef):
     """Handles normalizing and storing the final attention output."""
 
     cfgs: configs.RpaConfigs = dataclasses.field(metadata=dict(static=True))
@@ -397,7 +402,7 @@ class BatchingORef(pltpu.BufferedRef):
     ):
         assert buffer_type == pltpu.BufferType.OUTPUT
 
-        standard_ref = pltpu.BufferedRef.create(
+        standard_ref = pallas_compat.BufferedRef.create(
             spec=spec,
             dtype_or_type=dtype_or_type,
             buffer_type=buffer_type,
@@ -411,7 +416,7 @@ class BatchingORef(pltpu.BufferedRef):
             cfgs=cfgs,
             **{
                 f.name: getattr(standard_ref, f.name)
-                for f in dataclasses.fields(pltpu.BufferedRef)
+                for f in dataclasses.fields(pallas_compat.BufferedRef)
             },
         )
 
@@ -437,7 +442,7 @@ class BatchingORef(pltpu.BufferedRef):
 
         for i in range(len(dma_list)):
             q_src, q_sz, b = dma_list[i]
-            pltpu.make_async_copy(
+            pallas_compat.make_async_copy(
                 vmem_src.at[b, :, pl.ds(0, q_sz)],
                 o_hbm.at[:, pl.ds(q_src, q_sz)],
                 sem,
@@ -460,7 +465,7 @@ class BatchingORef(pltpu.BufferedRef):
 
         ref_u32 = o_hbm.bitcast(jnp.uint32)
         flat_ref = ref_u32.reshape((-1, 128))
-        pltpu.make_async_copy(
+        pallas_compat.make_async_copy(
             flat_ref.at[pl.ds(0, wait_lanes), :],
             flat_ref.at[pl.ds(0, wait_lanes), :],
             sem,
@@ -469,7 +474,7 @@ class BatchingORef(pltpu.BufferedRef):
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, kw_only=True)
-class BatchingLSERef(pltpu.BufferedRef):
+class BatchingLSERef(pallas_compat.BufferedRef):
     """Handles writing LSE values to HBM, overlapped with compute via double buffering."""
     cfgs: configs.RpaConfigs = dataclasses.field(metadata=dict(static=True))
 
@@ -485,7 +490,7 @@ class BatchingLSERef(pltpu.BufferedRef):
         priority: int = 0,
         strict_ordering: bool = False,
     ):
-        standard_ref = pltpu.BufferedRef.create(
+        standard_ref = pallas_compat.BufferedRef.create(
             spec=spec,
             dtype_or_type=dtype_or_type,
             buffer_type=buffer_type,
@@ -499,7 +504,7 @@ class BatchingLSERef(pltpu.BufferedRef):
             cfgs=cfgs,
             **{
                 f.name: getattr(standard_ref, f.name)
-                for f in dataclasses.fields(pltpu.BufferedRef)
+                for f in dataclasses.fields(pallas_compat.BufferedRef)
             },
         )
 
@@ -523,7 +528,7 @@ class BatchingLSERef(pltpu.BufferedRef):
             q_src, q_sz, b = dma_list[i]
             q_src = q_src * self.cfgs.aligned_num_q_heads_per_kv_head
             q_sz = q_sz * self.cfgs.aligned_num_q_heads_per_kv_head
-            pltpu.make_async_copy(
+            pallas_compat.make_async_copy(
                 vmem_src.at[b, :, pl.ds(0, q_sz)],
                 lse_hbm.at[:, pl.ds(q_src, q_sz)],
                 sem,
@@ -545,7 +550,7 @@ class BatchingLSERef(pltpu.BufferedRef):
         wait_lanes = pl.multiple_of(wait_lanes, 8)
         ref_u32 = lse_hbm.bitcast(jnp.uint32)
         flat_ref = ref_u32.reshape((-1, 128))
-        pltpu.make_async_copy(
+        pallas_compat.make_async_copy(
             flat_ref.at[pl.ds(0, wait_lanes), :],
             flat_ref.at[pl.ds(0, wait_lanes), :],
             sem,
@@ -554,7 +559,7 @@ class BatchingLSERef(pltpu.BufferedRef):
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, kw_only=True)
-class BatchingQRef(pltpu.BufferedRef):
+class BatchingQRef(pallas_compat.BufferedRef):
     """Handles fetching Q blocks using precomputed metadata."""
 
     cfgs: configs.RpaConfigs = dataclasses.field(metadata=dict(static=True))
@@ -573,7 +578,7 @@ class BatchingQRef(pltpu.BufferedRef):
     ):
         assert buffer_type == pltpu.BufferType.INPUT
 
-        standard_ref = pltpu.BufferedRef.create(
+        standard_ref = pallas_compat.BufferedRef.create(
             spec=spec,
             dtype_or_type=dtype_or_type,
             buffer_type=buffer_type,
@@ -587,7 +592,7 @@ class BatchingQRef(pltpu.BufferedRef):
             cfgs=cfgs,
             **{
                 f.name: getattr(standard_ref, f.name)
-                for f in dataclasses.fields(pltpu.BufferedRef)
+                for f in dataclasses.fields(pallas_compat.BufferedRef)
             },
         )
 
@@ -610,7 +615,7 @@ class BatchingQRef(pltpu.BufferedRef):
 
         for i in range(len(dma_list)):
             q_src, q_sz, b = dma_list[i]
-            pltpu.make_async_copy(
+            pallas_compat.make_async_copy(
                 q_hbm.at[:, pl.ds(q_src, q_sz)],
                 vmem_dst.at[b, :, pl.ds(0, q_sz)],
                 sem,
@@ -633,7 +638,7 @@ class BatchingQRef(pltpu.BufferedRef):
 
         vmem_u32 = vmem_dst.bitcast(jnp.uint32)
         flat_vmem = vmem_u32.reshape((-1, 128))
-        pltpu.make_async_copy(
+        pallas_compat.make_async_copy(
             flat_vmem.at[pl.ds(0, wait_lanes), :],
             flat_vmem.at[pl.ds(0, wait_lanes), :],
             sem,

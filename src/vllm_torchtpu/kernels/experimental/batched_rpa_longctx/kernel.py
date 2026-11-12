@@ -21,6 +21,7 @@ import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
 from jax import lax
 
+from vllm_torchtpu.kernels import pallas_compat
 # yapf: disable
 from vllm_torchtpu.kernels.experimental.batched_rpa_longctx import (
     bref_override, configs, flash_attention, schedule, stitch_utils, utils)
@@ -707,7 +708,7 @@ def rpa_kernel(
                         src_off = element_size * aligned_start_step
                         src_off = pl.multiple_of(src_off, 128)
 
-                        copy = pltpu.make_async_copy(
+                        copy = pallas_compat.make_async_copy(
                             h.at[pl.ds(src_off, read_size)],
                             s.at[pl.ds(0, read_size)],
                             dma_sem.at[0],
