@@ -191,11 +191,12 @@ class RpaConfigs:
         word_size_bytes = 4
         fixed_bytes *= word_size_bytes
 
-        # Respect XLA's xla_tpu_impure_smem_callee_ratio (0.6) so lsrav2
-        # keeps positive NodeHeadroom in SMEM for scalar register spilling
-        # instead of emitting synchronous 1-cacheline HBM spill DMAs.
-        smem_limit_bytes = (
-            int(pltpu.get_tpu_info().smem_capacity_bytes * 0.6) - 32 * 1024)
+        # The whole SMEM less a 32 KiB reserve. With total_q_tokens == 0
+        # this is the schedule capacity the runner admits steps against
+        # (wrapper.schedule_capacity), so a smaller budget refuses steps
+        # that fit. The workload bound below keeps calls with a small
+        # schedule (e.g. the decode buckets) well under it.
+        smem_limit_bytes = pltpu.get_tpu_info().smem_capacity_bytes - 32 * 1024
         available_bytes = smem_limit_bytes - fixed_bytes
 
         # Per step per batch item:

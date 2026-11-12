@@ -20,6 +20,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax._src import core as jax_core
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.kernels.megablox.gmm_v2 import apply_act_fn, interleave_lane
@@ -409,7 +410,8 @@ def _make_ep_inputs(num_local_experts, seed=0):
 @pytest.mark.parametrize(
     "num_local_experts,experts_start",
     [
-        (16, 0),  # rank 0: experts_start == 0 must behave like local expert IDs
+        (16,
+         0),  # rank 0: experts_start == 0 must behave like local expert IDs
         (16, 32),  # rank 2 of 8-way EP (Qwen3-30B shape: 128 / 8 = 16 local)
         (20,
          60),  # rank 3 of 8-way EP (Qwen3-480B-FP8 shape: 160 / 8 = 20 local)
@@ -725,6 +727,48 @@ def _routing_reference(topk_indices,
             np.argsort(order, kind="stable").astype(np.int32))
 
 
+def _spy_counting_sort(monkeypatch):
+    """Record each call of the counting sort (which path routing took)."""
+    calls = []
+    counting_sort = fused_moe_gmm._counting_sort_positions
+
+    def spy(*args, **kwargs):
+        calls.append(args)
+        return counting_sort(*args, **kwargs)
+
+    monkeypatch.setattr(fused_moe_gmm, "_counting_sort_positions", spy)
+    return calls
+
+
+def _prepare_routed_small(seed=0):
+    num_tokens, topk, local_num_experts = 100, 8, 16
+    rng = np.random.default_rng(seed)
+    ids = rng.integers(-1, local_num_experts, size=(num_tokens, topk))
+    return fused_moe_gmm.prepare_routed_gmm_inputs(
+        jnp.ones((num_tokens, 4), jnp.float32),
+        jnp.asarray(ids, jnp.int32),
+        jnp.full((num_tokens, topk), 0.5, jnp.float32),
+        local_num_experts=local_num_experts,
+        topk=topk,
+        use_ep=True,
+        use_sparse_core=False)
+
+
+@pytest.mark.parametrize("value,expected", [(None, False), ("", False),
+                                            ("0", False), ("false", False),
+                                            ("1", True), ("true", True)])
+def test_routing_counting_sort_follows_the_flag(monkeypatch, value, expected):
+    """The routing reads USE_MOE_COUNTING_SORT through envs: off unless the
+    variable enables it, so an unset, empty or "0" variable keeps argsort."""
+    if value is None:
+        monkeypatch.delenv("USE_MOE_COUNTING_SORT", raising=False)
+    else:
+        monkeypatch.setenv("USE_MOE_COUNTING_SORT", value)
+    calls = _spy_counting_sort(monkeypatch)
+    _prepare_routed_small()
+    assert bool(calls) is expected
+
+
 # M = 800 exercises the block padding (800 % 512), which lands in the sentinel
 # bucket this caller discards.
 @pytest.mark.parametrize("counting_sort", [True, False])
@@ -733,6 +777,7 @@ def _routing_reference(topk_indices,
 def test_prepare_routed_metadata_matches_stable_sort(structure, counting_sort,
                                                      monkeypatch):
     monkeypatch.setattr(envs, "USE_MOE_COUNTING_SORT", counting_sort)
+    counting_sort_calls = _spy_counting_sort(monkeypatch)
     num_tokens, topk, local_num_experts, hidden = 100, 8, 16, 4
     rng = np.random.default_rng(0)
     if structure == "mixed":
@@ -759,6 +804,8 @@ def test_prepare_routed_metadata_matches_stable_sort(structure, counting_sort,
         use_ep=True,
         use_sparse_core=False)
 
+    # The path under test is the one the flag selects.
+    assert bool(counting_sort_calls) is counting_sort
     want_tokens, want_group_sizes, want_revert = _routing_reference(
         topk_indices, topk_weights, local_num_experts)
     np.testing.assert_array_equal(
@@ -960,6 +1007,95 @@ def test_moe_gmm_onehot_combine_skip_padded_tokens_zeroes_nan(monkeypatch):
         })
 
     assert bool(jnp.all(jnp.isfinite(out.astype(jnp.float32))))
+
+
+@pytest.mark.parametrize("fill", [np.nan, np.inf])
+@pytest.mark.parametrize("use_ep, skip_padded_tokens", [(True, False),
+                                                        (False, True),
+                                                        (True, True)])
+def test_moe_gmm_plain_reduce_drops_uncomputed_rows(monkeypatch, use_ep,
+                                                    skip_padded_tokens, fill):
+    # Invalid routes (non-local experts under EP, padded tokens) sort past the
+    # valid prefix, whose gmm output rows are never written (NaN / Inf here).
+    # The plain reduce must drop those routes: a zero weight does not, since
+    # NaN * 0 and Inf * 0 are NaN.
+    kwargs = _small_moe_gmm_kwargs()
+    rows = kwargs["argsort_revert_indices"].size
+    num_tokens, topk, hidden = kwargs["num_tokens"], kwargs["topk"], 8
+    valid_rows = rows - 3
+    monkeypatch.setattr(fused_moe_gmm, "get_packing_factor",
+                        lambda *args, **kwargs: 1)
+    gmm2 = (jax.random.normal(jax.random.key(2),
+                              (rows, hidden)) / 10).astype(jnp.bfloat16)
+    gmm2 = gmm2.at[valid_rows:].set(fill)
+    outputs = iter([jnp.ones((rows, hidden), dtype=jnp.bfloat16), gmm2])
+    monkeypatch.setattr(fused_moe_gmm, "gmm_wrapper",
+                        lambda *args, **kwargs: next(outputs))
+    revert = kwargs["argsort_revert_indices"]
+    valid = revert < valid_rows
+    weights = jnp.linspace(0.1, 0.8, rows, dtype=jnp.float32)
+
+    out = fused_moe_gmm.moe_gmm(
+        **{
+            **kwargs,
+            "topk_weights_flat": weights,
+            "valid_mask_flat": valid,
+            "group_sizes": jnp.array([valid_rows], dtype=jnp.int32),
+            "use_ep": use_ep,
+            "use_sparse_core": False,
+            "skip_padded_tokens": skip_padded_tokens,
+        })
+
+    routed = np.asarray(gmm2, np.float32)[np.asarray(revert)]
+    routed = routed.reshape(num_tokens, topk, hidden)
+    weighted = routed * np.asarray(weights).reshape(num_tokens, topk, 1)
+    mask = np.asarray(valid).reshape(num_tokens, topk, 1)
+    expected = np.where(mask, weighted, 0).sum(axis=1)
+    out = np.asarray(out, dtype=np.float32)
+    assert np.isfinite(out).all()
+    np.testing.assert_allclose(out, expected, rtol=2e-2, atol=1e-3)
+
+
+@pytest.mark.parametrize("use_ep, skip_padded_tokens, selects_rows",
+                         [(False, False, False), (True, False, True),
+                          (False, True, True)])
+def test_moe_gmm_plain_reduce_selects_rows_only_if_some_are_uncomputed(
+        monkeypatch, use_ep, skip_padded_tokens, selects_rows):
+    # Without EP or skip_padded_tokens every gathered row is computed, so the
+    # plain reduce masks the [tokens, topk] weights only; the select over the
+    # [tokens, topk, hidden] rows is kept for the paths with uncomputed rows.
+    kwargs = _small_moe_gmm_kwargs()
+    rows = kwargs["argsort_revert_indices"].size
+    num_tokens, topk, hidden = kwargs["num_tokens"], kwargs["topk"], 8
+    monkeypatch.setattr(fused_moe_gmm, "get_packing_factor",
+                        lambda *args, **kwargs: 1)
+    monkeypatch.setattr(fused_moe_gmm, "gmm_wrapper",
+                        lambda lhs, *args, **kwargs: lhs)
+
+    def run(x, topk_weights_flat, valid_mask_flat):
+        return fused_moe_gmm.moe_gmm(
+            **{
+                **kwargs,
+                "x": x,
+                "topk_weights_flat": topk_weights_flat,
+                "valid_mask_flat": valid_mask_flat,
+                "use_ep": use_ep,
+                "use_sparse_core": False,
+                "skip_padded_tokens": skip_padded_tokens,
+            })
+
+    def select_shapes(jaxpr):
+        for eqn in jaxpr.eqns:
+            if eqn.primitive.name == "select_n":
+                yield eqn.outvars[0].aval.shape
+            for sub in jax_core.jaxprs_in_params(eqn.params):
+                yield from select_shapes(sub)
+
+    x = jnp.ones((rows, hidden), jnp.bfloat16)
+    jaxpr = jax.make_jaxpr(run)(x, kwargs["topk_weights_flat"],
+                                kwargs["valid_mask_flat"])
+    selects = list(select_shapes(jaxpr.jaxpr))
+    assert ((num_tokens, topk, hidden) in selects) == selects_rows, selects
 
 
 def test_moe_gmm_onehot_combine_keeps_operand_dtype(monkeypatch):

@@ -18,7 +18,7 @@ arrays, for decode-sized steps.
 the tables the pipeline reads (tile -> sequence, row base, row count, first
 and last tile flags, the per-sequence state slots) as XLA ops in the wrapper.
 This path fills the same tables with scalar loops in SMEM at kernel entry:
-a loop over the padded sequence count for the batched pass,
+a loop over the entries of the batched pass's live tiles,
 and a loop over the per-sequence range (empty on a decode step) for the other.
 The tables live in SMEM scratch, so the path serves steps whose tables fit:
 rows up to MAX_ROWS; larger steps keep the wrapper's XLA tables."""
@@ -68,10 +68,13 @@ class _ScalarRef:
 TABLE_NAMES = ("s_idx", "r_base", "r_size", "first", "last")
 
 
-def scratch_shapes(max_seqs: int, max_tokens: int) -> dict[str, Any]:
+def scratch_shapes(max_seqs: int, max_tokens: int,
+                   seq_tile_size: int) -> dict[str, Any]:
     """SMEM scratch for both passes' tables: the batched pass indexes its
-    tables by sequence (one tile entry per sequence), the per-sequence pass by
+    tables by sequence (one tile entry per sequence, padded to whole tiles of
+    `seq_tile_size`, which is what each tile reads), the per-sequence pass by
     tile (up to one per token)."""
+    num_b = pl.cdiv(max_seqs, seq_tile_size) * seq_tile_size
     d = {
         "tb_num_tiles": pltpu.SMEM((1, ), I32),
         "tp_num_tiles": pltpu.SMEM((1, ), I32),
@@ -81,7 +84,7 @@ def scratch_shapes(max_seqs: int, max_tokens: int) -> dict[str, Any]:
         "tp_read": pltpu.SMEM((max_seqs, ), I32)
     }
     for n in TABLE_NAMES:
-        d[f"tb_{n}"] = pltpu.SMEM((max_seqs, ), I32)
+        d[f"tb_{n}"] = pltpu.SMEM((num_b, ), I32)
         d[f"tp_{n}"] = pltpu.SMEM((max_tokens, ), I32)
     return d
 
@@ -110,7 +113,15 @@ def fill_and_wrap(qsl_ref, seq_lens_ref, state_ref, read_ref, dist_ref,
         return carry
 
     num_tiles_b = pl.cdiv(end_b, cfg_b.tile_size)
-    lax.fori_loop(0, num_tiles_b * cfg_b.tile_size, body_b, jnp.int32(0))
+    # Fill only the entries the live tiles read. Those past max_seqs have no
+    # sequence (and no qsl / seq_lens entry) to read: they are the pad below.
+    lax.fori_loop(0, jnp.minimum(num_tiles_b * cfg_b.tile_size, max_seqs),
+                  body_b, jnp.int32(0))
+    # The last tile reads whole tiles of entries: the pad past max_seqs is
+    # empty (no rows, no state copy).
+    for s in range(max_seqs, sc["tb_s_idx"].shape[0]):
+        for n in TABLE_NAMES:
+            sc[f"tb_{n}"][s] = jnp.int32(0)
     sc["tb_num_tiles"][0] = num_tiles_b
 
     chunk = cfg_p.chunk_size
