@@ -471,8 +471,7 @@ def down_product(ctx, expert, weight_slot, rows, row_scales):
                               elementwise=b.elementwise,
                               swiglu_limit=b.swiglu_limit,
                               columns_per_pass=b.activation_columns_per_pass,
-                              token_block=b.token_block,
-                              mask_non_finite=False)
+                              token_block=b.token_block)
 
 
 def finish_rows(ctx, expert, acc2, mid_scales):
@@ -487,8 +486,7 @@ def finish_rows(ctx, expert, acc2, mid_scales):
                            w2_scales=w2_scales,
                            w2_bias=w2_bias,
                            dtype=b.result_dtype,
-                           elementwise=b.elementwise,
-                           mask_non_finite=False)
+                           elementwise=b.elementwise)
 
 
 # ---- the push and the drains ----

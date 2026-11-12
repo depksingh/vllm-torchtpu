@@ -584,8 +584,7 @@ def start_transport(rows,
                 quantized, scale = quantize_rows(rows_vmem[i % 2],
                                                  scale_dtype,
                                                  block=activation_block,
-                                                 dtype=elementwise,
-                                                 mask_non_finite=False)
+                                                 dtype=elementwise)
             if i >= 2:
                 write_gathered_rows(i - 2).wait()
                 if num_shards > 1:

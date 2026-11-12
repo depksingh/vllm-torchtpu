@@ -100,8 +100,7 @@ def intermediate_rows(acc1,
                       block=0,
                       dtype=jnp.float32,
                       swiglu_limit=SWIGLU_LIMIT_DEFAULT,
-                      columns_per_pass=ACTIVATION_COLUMNS_PER_PASS_DEFAULT,
-                      mask_non_finite=True):
+                      columns_per_pass=ACTIVATION_COLUMNS_PER_PASS_DEFAULT):
     """The first matmul's accumulator through the activation, requantized
     to fp8 as the second matmul's left-hand side.
 
@@ -154,12 +153,7 @@ def intermediate_rows(acc1,
             chunk = activated(lo, lo + block)
             amax = jnp.max(jnp.abs(chunk), axis=-1, keepdims=True)
             scale, inverse, scalable = row_scale(amax)
-            chunks.append(
-                apply_row_scale(chunk,
-                                inverse,
-                                scalable,
-                                dtype,
-                                mask_non_finite=mask_non_finite))
+            chunks.append(apply_row_scale(chunk, inverse, scalable, dtype))
             scales.append(scale)
         return (jnp.concatenate(chunks,
                                 axis=-1), jnp.concatenate(scales, axis=-1))
@@ -173,18 +167,10 @@ def intermediate_rows(acc1,
         amax = slice_amax if amax is None else jnp.maximum(amax, slice_amax)
     scale, inverse, scalable = row_scale(amax)
     if len(chunks) == 1:
-        quantized = apply_row_scale(chunks[0],
-                                    inverse,
-                                    scalable,
-                                    dtype,
-                                    mask_non_finite=mask_non_finite)
+        quantized = apply_row_scale(chunks[0], inverse, scalable, dtype)
     else:
         quantized = jnp.concatenate([
-            apply_row_scale(chunk,
-                            inverse,
-                            scalable,
-                            dtype,
-                            mask_non_finite=mask_non_finite)
+            apply_row_scale(chunk, inverse, scalable, dtype)
             for chunk in chunks
         ],
                                     axis=-1)
@@ -197,8 +183,7 @@ def result_rows(acc2,
                 w2_scales,
                 w2_bias,
                 dtype=FP8,
-                elementwise=jnp.float32,
-                mask_non_finite=True):
+                elementwise=jnp.float32):
     """The second matmul's accumulator as result rows: fp8 rows and their
     scales, or (dtype bf16) bf16 rows and None. `elementwise` is the
     element type the fp8 scaling product is formed in.
@@ -218,9 +203,7 @@ def result_rows(acc2,
         down = down + w2_bias
     if jnp.dtype(dtype) == jnp.dtype(jnp.bfloat16):
         return down.astype(jnp.bfloat16), None
-    return quantize_rows(down.astype(jnp.bfloat16),
-                         dtype=elementwise,
-                         mask_non_finite=mask_non_finite)
+    return quantize_rows(down.astype(jnp.bfloat16), dtype=elementwise)
 
 
 def expert_ffn_fp8(rows,
@@ -236,8 +219,7 @@ def expert_ffn_fp8(rows,
                    elementwise=jnp.float32,
                    swiglu_limit=SWIGLU_LIMIT_DEFAULT,
                    columns_per_pass=ACTIVATION_COLUMNS_PER_PASS_DEFAULT,
-                   token_block=None,
-                   mask_non_finite=True):
+                   token_block=None):
     """One expert's FFN on fp8 weights with per-channel scales. `block` is
     the intermediate's rounding block (0: one scale per row), `token_block`
     the token rows' (None: the same as `block`). Returns the down matmul's
@@ -263,8 +245,7 @@ def expert_ffn_fp8(rows,
                                         block=block,
                                         dtype=elementwise,
                                         swiglu_limit=swiglu_limit,
-                                        columns_per_pass=columns_per_pass,
-                                        mask_non_finite=mask_non_finite)
+                                        columns_per_pass=columns_per_pass)
     if block:
         return blocked_rows_dot(mid, w2, mid_scales, block), None
     acc2 = lax.dot_general(mid,

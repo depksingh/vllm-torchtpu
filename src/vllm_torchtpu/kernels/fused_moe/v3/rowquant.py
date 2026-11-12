@@ -38,12 +38,7 @@ def row_scale(row_amax, scale_dtype=jnp.float32):
     return scale, inverse, scalable
 
 
-def apply_row_scale(rows,
-                    inverse_scale,
-                    scalable,
-                    dtype=jnp.float32,
-                    *,
-                    mask_non_finite=True):
+def apply_row_scale(rows, inverse_scale, scalable, dtype=jnp.float32):
     """Quantizes each row by its inverse scale. A row without one is zeroed.
 
     `dtype` is the element type the product is formed in before the fp8
@@ -55,17 +50,10 @@ def apply_row_scale(rows,
     different fp8 values.
     """
     scaled = rows.astype(dtype) * inverse_scale.astype(dtype)
-    if not mask_non_finite:
-        return scaled.astype(FP8)
     return jnp.where(scalable, scaled, jnp.zeros_like(scaled)).astype(FP8)
 
 
-def quantize_rows(rows,
-                  scale_dtype=jnp.float32,
-                  block=0,
-                  dtype=jnp.float32,
-                  *,
-                  mask_non_finite=True):
+def quantize_rows(rows, scale_dtype=jnp.float32, block=0, dtype=jnp.float32):
     """Per-row fp8 quantization of a [rows, n] array: the maximum in the
     array's own dtype, the scaling product in `dtype` (apply_row_scale).
     Returns (fp8 rows, f32 scales [rows, 1]).
@@ -77,11 +65,7 @@ def quantize_rows(rows,
     if not block:
         row_amax = jnp.max(jnp.abs(rows), axis=-1, keepdims=True)
         scale, inverse, scalable = row_scale(row_amax, scale_dtype)
-        return apply_row_scale(rows,
-                               inverse,
-                               scalable,
-                               dtype,
-                               mask_non_finite=mask_non_finite), scale
+        return apply_row_scale(rows, inverse, scalable, dtype), scale
     width = rows.shape[-1]
     if width % block:
         raise ValueError(f"a row of {width} values is not a whole number of "
@@ -91,12 +75,7 @@ def quantize_rows(rows,
         chunk = rows[:, lo:lo + block]
         amax = jnp.max(jnp.abs(chunk), axis=-1, keepdims=True)
         scale, inverse, scalable = row_scale(amax, scale_dtype)
-        quantized.append(
-            apply_row_scale(chunk,
-                            inverse,
-                            scalable,
-                            dtype,
-                            mask_non_finite=mask_non_finite))
+        quantized.append(apply_row_scale(chunk, inverse, scalable, dtype))
         scales.append(scale)
     return (jnp.concatenate(quantized,
                             axis=-1), jnp.concatenate(scales, axis=-1))
