@@ -23,6 +23,8 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels import pallas_compat
+
 # Util.
 
 
@@ -935,8 +937,9 @@ def kernel_main(
             up=rhs_spec,
         )
 
-    # Execute the inner kernel.
-    pipeline_fn = pltpu.emit_pipeline(
+    # Execute the inner kernel. `priority` is forwarded only by a Pallas
+    # build whose emit_pipeline takes it.
+    pipeline_fn = pallas_compat.emit_pipeline(
         functools.partial(inner_kernel, cfgs=cfgs),
         grid=(num_n, num_gm, num_k),
         in_specs=(lhs_spec, rhs_spec),
