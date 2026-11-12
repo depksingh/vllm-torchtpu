@@ -14,7 +14,9 @@
 """The SparseCore collective-offload flags env_override adds to LIBTPU_INIT_ARGS.
 
 The offload thresholds follow the chip family, read from TPU_ACCELERATOR_TYPE
-or the GCE metadata server; a flag in LIBTPU_INIT_ARGS wins.
+or the GCE metadata server. On TPU7x with that auto threshold the SparseCore
+all-reduce offload is also turned off; an explicit threshold, another chip
+family or the flag in LIBTPU_INIT_ARGS keeps it as it is.
 """
 import importlib
 import os
@@ -78,6 +80,28 @@ def test_tpu7x_auto_threshold_turns_sc_all_reduce_offload_off(
         _AR_MIN: str(64 * _MIB),
         _AG_MIN: str(64 * _MIB),
     }
+
+
+@pytest.mark.parametrize("tpu_type, vmem_bytes", [
+    ("v6e-8", 128 * _MIB),
+    ("v5p-8", 64 * _MIB),
+    ("v5litepod-4", 128 * _MIB),
+])
+def test_other_families_keep_sc_all_reduce_offload(libtpu_flags, tpu_type,
+                                                   vmem_bytes):
+    assert _sc_flags(libtpu_flags({"TPU_ACCELERATOR_TYPE": tpu_type})) == {
+        _AR_MIN: str(vmem_bytes),
+        _AG_MIN: str(vmem_bytes),
+    }
+
+
+def test_explicit_threshold_keeps_sc_all_reduce_offload(libtpu_flags):
+    """The threshold is one for the SC offload to use, so it stays on."""
+    flags = libtpu_flags({
+        "TPU_ACCELERATOR_TYPE": "tpu7x-8",
+        "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES": str(_MIB),
+    })
+    assert _sc_flags(flags) == {_AR_MIN: str(_MIB), _AG_MIN: str(_MIB)}
 
 
 @pytest.mark.parametrize("value", ["0", "not-a-number"])
