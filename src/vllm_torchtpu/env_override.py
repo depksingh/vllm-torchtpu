@@ -152,8 +152,7 @@ def _resolve_sc_offload_threshold_bytes() -> int | None:
             return None
         return value if value > 0 else None
 
-    tpu_type = (os.getenv("TPU_ACCELERATOR_TYPE")
-                or os.getenv("HIEREVO_TARGET_NAME"))
+    tpu_type = os.getenv("TPU_ACCELERATOR_TYPE")
     if not tpu_type:
         tpu_type = _fetch_tpu_type_from_metadata()
     if not tpu_type:
