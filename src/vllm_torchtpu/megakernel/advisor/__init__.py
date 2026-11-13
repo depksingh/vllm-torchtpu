@@ -15,7 +15,18 @@
 
 from __future__ import annotations
 
-from . import chips, constants, jax_bridge, models, specs
+from . import (
+    chips,
+    constants,
+    jax_bridge,
+    models,
+    roofline,
+    spec_bridge,
+    specs,
+    support,
+    verdict,
+    vmem,
+)
 from .chips import (
     BUILTIN_CHIP_SPECS,
     REQUIRED_CHIP_SPEC_KEYS,
@@ -49,8 +60,11 @@ from .models import (
     resolve_model_profile,
     supports_hf_config,
 )
+from .roofline import validate_workload
+from .spec_bridge import advise_from_spec
 from .specs import (
     SUPPORTED_ONCHIP_FAMILIES,
+    AdvisorReport,
     DispatchRegime,
     EfficiencySpec,
     FusionScope,
@@ -61,14 +75,28 @@ from .specs import (
     ProvenanceMetric,
     ProvenanceTag,
     RingPlan,
+    ScopeEstimate,
     SupportStatus,
     WorkloadSpec,
     default_double_buffer_ring_plan,
     load_measurements,
 )
+from .support import CORE_LIMITS, CoreLimits, evaluate_support
+from .verdict import (
+    advise,
+    compare_parallelism_candidates,
+    compute_scope_raw_step_us,
+)
+from .vmem import (
+    compute_all_reduce_transfer_cost,
+    compute_per_token_vmem_bytes,
+    fit_vmem_budget_bytes,
+    validate_advise_inputs,
+)
 
 __all__ = [
     "BUILTIN_CHIP_SPECS",
+    "CORE_LIMITS",
     "DEPLOYMENT_PRESETS",
     "DEPLOYMENT_PRESET_SOURCES",
     "MODEL_PRESETS",
@@ -81,7 +109,9 @@ __all__ = [
     "SUPPORTED_ONCHIP_FAMILIES",
     "TPU6E_TOPOLOGIES",
     "TPU7X_TOPOLOGIES",
+    "AdvisorReport",
     "ChipSpec",
+    "CoreLimits",
     "DeploymentPreset",
     "DispatchRegime",
     "EfficiencySpec",
@@ -96,14 +126,23 @@ __all__ = [
     "ProvenanceMetric",
     "ProvenanceTag",
     "RingPlan",
+    "ScopeEstimate",
     "SupportStatus",
     "UnsupportedArchitectureError",
     "UnsupportedChipError",
     "WorkloadSpec",
+    "advise",
+    "advise_from_spec",
     "chips",
+    "compare_parallelism_candidates",
+    "compute_all_reduce_transfer_cost",
+    "compute_per_token_vmem_bytes",
+    "compute_scope_raw_step_us",
     "constants",
     "default_double_buffer_ring_plan",
     "detect_tpu_from_sysfs",
+    "evaluate_support",
+    "fit_vmem_budget_bytes",
     "jax_bridge",
     "load_chip_spec_file",
     "load_measurements",
@@ -114,7 +153,14 @@ __all__ = [
     "resolve_chip_spec",
     "resolve_hf_snapshot_config",
     "resolve_model_profile",
+    "roofline",
+    "spec_bridge",
     "specs",
+    "support",
     "supports_hf_config",
+    "validate_advise_inputs",
+    "validate_workload",
+    "verdict",
     "verify_chip_spec_against_jax",
+    "vmem",
 ]
