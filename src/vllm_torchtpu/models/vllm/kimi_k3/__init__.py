@@ -19,12 +19,12 @@ from .model import KimiK3ForConditionalGeneration, KimiLinearForCausalLM, KimiMo
 from .moe import KimiMoE
 
 __all__ = [
-    "KimiDeltaAttention",
     "K3DSparkForCausalLM",
     "K3DSparkModel",
+    "KimiDeltaAttention",
     "KimiK3ForConditionalGeneration",
     "KimiLinearForCausalLM",
-    "KimiModel",
     "KimiMoE",
+    "KimiModel",
     "MultiHeadLatentAttention",
 ]

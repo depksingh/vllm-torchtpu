@@ -29,6 +29,6 @@ __all__ = [
     "all_reduce",
     "can_use_moe_tp_decode",
     "exact_in_bf16",
-    "moe_tp_decode",
     "kernel_name",
+    "moe_tp_decode",
 ]

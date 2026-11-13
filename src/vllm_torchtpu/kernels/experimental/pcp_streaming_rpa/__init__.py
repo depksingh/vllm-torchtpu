@@ -23,8 +23,8 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.wrapper import (
 )
 
 __all__ = [
-    "PCP_STREAMING_RPA_LOCAL_COMPILE_TOKEN_MULTIPLE",
     "PCP_AXIS_NAME",
+    "PCP_STREAMING_RPA_LOCAL_COMPILE_TOKEN_MULTIPLE",
     "compute_pcp_local_mapping",
     "pcp_streaming_attention_page_groups_packed_local_from_metadata",
     "sharded_pcp_ragged_paged_attention",

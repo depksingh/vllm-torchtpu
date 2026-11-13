@@ -59,10 +59,10 @@ WeightBufferPlan = host.WeightBufferPlan
 # outside this repository binds to the names below.
 __all__ = [
     "WEIGHT_FORMS",
+    "WeightBufferPlan",
     "WeightFormat",
     "adaptive_fused_moe",
+    "select_weight_buffers",
     "vmem_estimate_bytes",
     "vmem_limit",
-    "select_weight_buffers",
-    "WeightBufferPlan",
 ]

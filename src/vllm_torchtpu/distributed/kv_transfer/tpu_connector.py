@@ -116,17 +116,17 @@ from vllm_torchtpu.utils import synchronize_tensors
 logger = init_logger(__name__)
 
 __all__ = [
+    "LoadMeta",
+    "SendMeta",
     "TPUConnector",
+    "TPUConnectorMetadata",
     "TPUConnectorScheduler",
     "TPUConnectorWorker",
     "TPURaidenConnector",
     "TPURaidenConnectorScheduler",
     "TPURaidenConnectorWorker",
-    "TPUConnectorMetadata",
-    "SendMeta",
-    "LoadMeta",
-    "_CoordSendEntry",
     "_CoordRecvEntry",
+    "_CoordSendEntry",
     "stage3_fa_raiden_id_fields",
 ]
 

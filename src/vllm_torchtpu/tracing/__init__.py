@@ -25,8 +25,8 @@ from vllm_torchtpu.tracing.utils import (
 
 __all__ = [
     "TraceAnnotation",
-    "is_trace_annotation_enabled",
     "extract_kv_lens_for_tracing",
     "extract_request_ids_for_tracing",
+    "is_trace_annotation_enabled",
     "trim_request_id_suffix",
 ]

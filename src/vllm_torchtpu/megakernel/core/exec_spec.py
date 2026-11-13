@@ -280,13 +280,13 @@ class ExecSpec:
 
 
 __all__ = [
+    "MAX_BATCH_ROWS",
+    "TILE_NUMERICS",
     "DebugModulesMap",
     "DebugOptions",
     "ExecSpec",
-    "MAX_BATCH_ROWS",
     "ModuleOptionsMap",
     "NumericsClass",
-    "TILE_NUMERICS",
     "Tiles",
     "TunablesMap",
     "debug_class",
