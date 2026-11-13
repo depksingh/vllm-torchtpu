@@ -13,7 +13,7 @@
 # limitations under the License.
 """Shared-core interface implementations for experimental Qwen3.8-Flash."""
 
-from vllm_torchtpu.models.qwen38_flash.experimental import settings
+from . import settings
 
 QWEN4_EXP_ARCHITECTURES = (
     "Qwen4ExpForCausalLM",
@@ -22,6 +22,7 @@ QWEN4_EXP_ARCHITECTURES = (
 
 _PKG = "vllm_torchtpu.models.qwen38_flash.experimental"
 _MODEL = f"{_PKG}.model:Qwen4ExpForCausalLM"
+_MTP_MODEL = f"{_PKG}.mtp:Qwen4ExpMTP"
 
 
 def enabled() -> bool:
@@ -39,6 +40,29 @@ def register() -> None:
     if not enabled():
         return
     from vllm.model_executor.models import ModelRegistry
+    from vllm.model_executor.models.config import MODELS_CONFIG_MAP
+
+    from .config import (
+        TPUQwen4ExpConfig,
+    )
 
     for arch in QWEN4_EXP_ARCHITECTURES:
         ModelRegistry.register_model(arch, _MODEL)
+        MODELS_CONFIG_MAP[arch] = TPUQwen4ExpConfig
+    # Upstream's speculative config maps qwen4_exp to this MTP architecture.
+    ModelRegistry.register_model("Qwen4ExpMTP", _MTP_MODEL)
+
+    from vllm_torchtpu.compilation.tpu_compiler import register_compile_cache_key
+    from vllm_torchtpu.platforms.tpu_platform import register_tpu_kv_connector
+
+    from .config import PD_CONNECTOR
+
+    register_tpu_kv_connector(PD_CONNECTOR, f"{_PKG}.pd_connector")
+
+    # kernels/ and ops/ are hashed by the shared rule; the pooled cache layout
+    # changes graph argument extents, and the settings change graphs.
+    register_compile_cache_key(
+        "qwen38_flash",
+        paths=("vllm_torchtpu/models/qwen38_flash/experimental/pool_layout.py",),
+        env_factors=settings.compile_key_factors,
+    )
