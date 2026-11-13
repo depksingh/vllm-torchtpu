@@ -20,8 +20,6 @@ from . import (
     calibrate,
     chips,
     cli,
-    constants,
-    jax_bridge,
     models,
     regimes,
     report,
@@ -33,6 +31,7 @@ from . import (
     vmem,
     workbench,
     workbench_engine,
+    workbench_phase,
 )
 from .calibrate import CalibrateOptions, calibrate_trace
 from .chips import (
@@ -126,12 +125,11 @@ from .vmem import (
     fit_vmem_budget_bytes,
     validate_advise_inputs,
 )
-from .workbench import (
-    render_workbench_body,
-    render_workbench_css,
-    render_workbench_script,
-)
 from .workbench_engine import render_workbench_engine_js
+from .workbench_phase import (
+    render_phase_extension_js,
+    render_phase_stage_tab_button,
+)
 
 __all__ = [
     "BUCKET_CONSUMER_STATUS",
@@ -154,6 +152,7 @@ __all__ = [
     "AdvisorSweepReport",
     "BucketSchedulePayload",
     "BucketScheduleRule",
+    "CalibrateOptions",
     "ChipSpec",
     "CoreLimits",
     "DeploymentPreset",
@@ -166,8 +165,8 @@ __all__ = [
     "MoEMode",
     "ModelProfile",
     "ObjectiveMode",
-    "ParallelismRecommendation",
     "ParallelLayout",
+    "ParallelismRecommendation",
     "Phase",
     "ProvenanceMetric",
     "ProvenanceTag",
@@ -187,21 +186,18 @@ __all__ = [
     "build_bucket_schedule",
     "calibrate",
     "calibrate_trace",
-    "CalibrateOptions",
-    "cli",
     "chips",
+    "cli",
     "compare_parallelism_candidates",
     "compute_all_reduce_transfer_cost",
     "compute_per_token_vmem_bytes",
     "compute_scope_raw_step_us",
-    "constants",
     "default_double_buffer_ring_plan",
     "detect_tpu_from_sysfs",
     "evaluate_support",
     "fit_vmem_budget_bytes",
     "format_advisor_summary",
     "format_regime_table",
-    "jax_bridge",
     "load_chip_spec_file",
     "load_measurements",
     "load_public_calibration",
@@ -209,13 +205,15 @@ __all__ = [
     "model_profile_from_hf_config",
     "models",
     "primary_step_mode",
+    "public_calibration_path",
     "recommend_parallelism",
     "regimes",
     "render_advisor_html",
-    "render_workbench_engine_js",
+    "render_phase_extension_js",
+    "render_phase_stage_tab_button",
     "render_regime_dot_plot_svg",
+    "render_workbench_engine_js",
     "report",
-    "public_calibration_path",
     "resolve_chip_spec",
     "resolve_hf_snapshot_config",
     "resolve_model_profile",
@@ -232,9 +230,7 @@ __all__ = [
     "vmem",
     "workbench",
     "workbench_engine",
-    "render_workbench_body",
-    "render_workbench_css",
-    "render_workbench_script",
+    "workbench_phase",
     "write_advisor_html",
     "write_bucket_schedule",
 ]
