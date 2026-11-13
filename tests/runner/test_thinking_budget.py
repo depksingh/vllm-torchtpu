@@ -1335,9 +1335,9 @@ class TestSampleTokens:
         assert emitted_s == [50, 50, GEMMA4_END[0], GEMMA4_END[1]]
 
     def test_sample_plain_chunk_budget_processor_and_logprob_logits(self) -> None:
-        """``_sample_plain_chunk`` runs the ``tb_step`` plain-chunk processor:
-        a budget of 0 forces ``end_ids[0]`` after ``logprob_logits`` is taken,
-        and advances the request's budget state."""
+        """``_sample_plain_chunk`` runs the budget's plain-chunk processor from
+        ``processors``: a budget of 0 forces ``end_ids[0]`` after
+        ``logprob_logits`` is taken, and advances the request's budget state."""
         cfg = _reasoning_config(list(GEMMA4_START), list(GEMMA4_END))
         sp = SamplingParams(temperature=0.0, thinking_token_budget=0)
         req = _request_state("r0", [1, *GEMMA4_START], sp)
@@ -1348,6 +1348,8 @@ class TestSampleTokens:
 
         tb_step = runner._thinking_budget.step_state(["r0"], {"r0": req}, frozenset())
         assert tb_step is not None
+        tb_chunk = tb_step.plain_chunk(runner.input_batch.req_ids, 0, 1)
+        assert tb_chunk is not None
         selected, logprob_logits = runner._sample_plain_chunk(
             raw.clone(),
             cur_start_idx=0,
@@ -1359,7 +1361,7 @@ class TestSampleTokens:
             scheduler_output=SimpleNamespace(scheduled_spec_decode_tokens={}),
             is_spec_step=False,
             min_toks={},
-            tb_step=tb_step,
+            processors=(tb_chunk,),
         )
         # The forced token beats the argmax 13; the logprobs see neither the
         # forcing nor an in-place write.

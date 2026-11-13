@@ -16,9 +16,9 @@
 ``TPUModelRunner._sample_plain_chunk`` runs ``PlainChunkProcessor`` hooks on
 plain decode chunks and on draft-less chunks of speculative steps;
 ``TPUModelRunner._sample_spec_verify_chunk`` runs ``SpecChunkProcessor`` hooks
-on verify chunks. Stateful processors (``thinking_token_budget``) implement
-both; a stateless ``logits -> logits`` mask (``min_tokens``) is wrapped in
-``StatelessPlainChunkProcessor``.
+on verify chunks. Stateful processors, such as penalties, ``bad_words`` or a
+thinking-token budget, can implement them; the stateless ``min_tokens`` mask is
+wrapped in ``StatelessPlainChunkProcessor``.
 """
 
 from __future__ import annotations

@@ -5016,34 +5016,29 @@ class TPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         is_spec_step: bool,
         min_toks: min_tokens_mask.MinTokensState,
-        tb_step: thinking_budget_tracker.ThinkingBudgetStepState | None,
+        processors: Sequence[chunk_processors.PlainChunkProcessor] = (),
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Mask and sample a plain chunk ``[cur_start_idx, cur_end_idx)``.
 
         ``is_spec_step`` marks a draft-less chunk inside a speculative step,
         whose grammar rows follow ``scheduled_spec_decode_tokens``. With
         ``top_tokens``, ``logits`` holds each row's greedy token instead.
+        ``processors`` run after the ``min_tokens`` mask, in order.
 
         Returns ``(selected_token_ids, logprob_logits)``. As in upstream vLLM
         (``apply_grammar_bitmask`` before ``Sampler.raw_logprobs``, then the
         logits processors), ``logprob_logits`` is taken after the grammar mask
-        and before the ``PlainChunkProcessor`` hooks (``min_tokens``,
-        ``thinking_token_budget``) run.
+        and before the ``PlainChunkProcessor`` hooks run.
         """
-        processors: list[chunk_processors.PlainChunkProcessor] = []
+        chunk_procs: list[chunk_processors.PlainChunkProcessor] = []
         if min_toks and not top_tokens:
             rows = min_tokens_mask.plain_rows(min_toks, cur_start_idx, cur_end_idx)
-            processors.append(
+            chunk_procs.append(
                 chunk_processors.StatelessPlainChunkProcessor(
                     lambda lg: self._mask_min_tokens(lg, rows, min_toks)
                 )
             )
-        if tb_step is not None:
-            tb_proc = tb_step.plain_chunk(
-                self.input_batch.req_ids, cur_start_idx, cur_end_idx
-            )
-            if tb_proc is not None:
-                processors.append(tb_proc)
+        chunk_procs.extend(processors)
 
         if grammar_output is not None:
             if is_spec_step:
@@ -5061,15 +5056,16 @@ class TPUModelRunner(GPUModelRunner):
                     logits, grammar_output, cur_start_idx, cur_end_idx
                 )
         logprob_logits = logits
+        if not top_tokens:
+            for proc in chunk_procs:
+                logits = proc.mask_logits(logits)
 
         with self._stage_timing.stage("sample"):
             if top_tokens:
                 selected = logits
-                for proc in processors:
+                for proc in chunk_procs:
                     selected = proc.override_top_tokens(selected)
             else:
-                for proc in processors:
-                    logits = proc.mask_logits(logits)
                 if all_greedy:
                     selected = self._greedy_sample(logits)
                 else:
@@ -5093,7 +5089,7 @@ class TPUModelRunner(GPUModelRunner):
                         ),
                         apply_topk_topp=self._sampler_applies_topk_topp(),
                     )
-                for proc in processors:
+                for proc in chunk_procs:
                     proc.on_sampled(selected)
         return selected, logprob_logits
 
@@ -5341,6 +5337,9 @@ class TPUModelRunner(GPUModelRunner):
         # Per-chunk device rejection outputs, kept for the async-spec
         # producer below.
         next_tokens_per_chunk: list[torch.Tensor] = []
+        # Partial-prefill requests discard their sampled token. They are known
+        # before sampling, for per-chunk processors; their generators are
+        # rewound after sampling, below.
         discard_sampled_tokens_req_indices: list[int] = []
         discard_sampled_tokens_req_ids: set[str] = set()
         req_ids = cast(list[str], self.input_batch.req_ids[: self.input_batch.num_reqs])
@@ -5353,8 +5352,8 @@ class TPUModelRunner(GPUModelRunner):
                 + scheduler_output.num_scheduled_tokens[req_id]
             )
             if seq_len < req_state.num_tokens:
-                # Record the index and ID of partial-prefill requests whose
-                # sampled tokens are discarded.
+                # Record the index of the request that should not be sampled,
+                # so that we could clear the sampled tokens before returning.
                 discard_sampled_tokens_req_indices.append(i)
                 discard_sampled_tokens_req_ids.add(req_id)
             else:
@@ -5432,6 +5431,13 @@ class TPUModelRunner(GPUModelRunner):
                             )
                         )
                 else:
+                    tb_chunk = (
+                        None
+                        if tb_step is None
+                        else tb_step.plain_chunk(
+                            self.input_batch.req_ids, cur_start_idx, cur_end_idx
+                        )
+                    )
                     selected, logprob_logits = self._sample_plain_chunk(
                         logits,
                         cur_start_idx=cur_start_idx,
@@ -5443,7 +5449,7 @@ class TPUModelRunner(GPUModelRunner):
                         scheduler_output=scheduler_output,
                         is_spec_step=True,
                         min_toks=min_toks,
-                        tb_step=tb_step,
+                        processors=(tb_chunk,) if tb_chunk is not None else (),
                     )
                     assert self.speculative_config is not None
                     padded = torch.full(
@@ -5481,6 +5487,13 @@ class TPUModelRunner(GPUModelRunner):
                 # Non-spec step (prefill / plain decode): reset the mamba
                 # read offsets so the next step resumes from the group base.
                 self._update_mamba_slot_read_offsets(mamba_indices, None, num_reqs)
+                tb_chunk = (
+                    None
+                    if tb_step is None
+                    else tb_step.plain_chunk(
+                        self.input_batch.req_ids, cur_start_idx, cur_end_idx
+                    )
+                )
                 selected_token_ids, logprob_logits = self._sample_plain_chunk(
                     logits,
                     cur_start_idx=cur_start_idx,
@@ -5492,7 +5505,7 @@ class TPUModelRunner(GPUModelRunner):
                     scheduler_output=scheduler_output,
                     is_spec_step=False,
                     min_toks=min_toks,
-                    tb_step=tb_step,
+                    processors=(tb_chunk,) if tb_chunk is not None else (),
                 )
                 # NOTE (NickLucche) Use the original logits (before any penalties or
                 # temperature scaling) for the top-k logprobs. We can't enforce it
